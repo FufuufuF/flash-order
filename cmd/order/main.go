@@ -52,6 +52,8 @@ func run() (runErr error) {
 	}()
 
 	slog.Info("database_connected")
+	// TODO(002，小步 A)：完成 http.go 后，用 return runHTTP(signalContext, db)
+	// 替换下面的等待信号逻辑。先保留上一阶段已验收的启动行为。
 	<-signalContext.Done()
 	slog.Info("shutdown_requested")
 
