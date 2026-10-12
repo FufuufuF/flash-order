@@ -3,6 +3,8 @@ package order
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"time"
 )
 
@@ -16,10 +18,36 @@ func NewStore(db *sql.DB) *Store {
 }
 
 func (s *Store) FindByID(ctx context.Context, id int64) (Order, error) {
-	// TODO(002，小步 A)：通过 s.db.QueryRowContext 查询并 Scan。
+	// 通过 s.db.QueryRowContext 查询并 Scan。
 	// 显式选择订单字段，不使用 SELECT *；参数使用 ? 占位符。
 	// sql.ErrNoRows → ErrOrderNotFound；其他错误不能伪装成查不到。
-	return Order{}, ErrNotImplemented
+
+	query := `
+		SELECT id, request_id, product_id, quantity, created_at
+		FROM orders
+		WHERE id = ?
+	`
+
+	row := s.db.QueryRowContext(ctx, query, id)
+
+	var result Order
+	err := row.Scan(
+		&result.ID,
+		&result.RequestID,
+		&result.ProductID,
+		&result.Quantity,
+		&result.CreatedAt,
+	)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Order{}, ErrOrderNotFound
+		}
+
+		return Order{}, fmt.Errorf("%w: %w", ErrStorageUnavailable, err)
+	}
+
+	return result, nil
 }
 
 func (s *Store) FindByRequestID(ctx context.Context, requestID string) (Order, error) {

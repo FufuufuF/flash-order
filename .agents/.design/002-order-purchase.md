@@ -2,10 +2,11 @@
 
 ## 1. 文档状态与学习约定
 
-- 状态：设计已确定；本轮仅搭建可编译的 Go 框架，业务实现和数据库验收待学习者完成。
+- 状态：设计已确定；框架、查单代码和 HTTP 启停已实现，HTTP 生命周期本地测试通过；下单业务、部分 Server 配置和真实数据库验收待完成。
 - 前置阶段：`001-database-bootstrap.md`。已有数据库连接、退出清理和版本 1 三张表。
 - 本文承接最近讨论：本阶段直接实现事务、`SELECT ... FOR UPDATE` 和 request_id 唯一约束，不再从无并发保护的版本开始。
 - 学习者亲手实现 TODO。辅助 agent 每次只指导一个小步骤：解释问题和取舍，给函数签名、伪代码或关键 SQL，等待学习者尝试，再审查。未经明确授权，不补齐整条链路或生成完整文件。
+- 教学粒度补充：一个教学轮次只引入一个主要知识点或一组紧密相关的 API。先解释用途、输入输出和一个最小例子，再让学习者用自己的话复述或预测行为；确认理解后才进入下一个知识点或要求写代码。遇到 HTTP、事务、并发等密集章节，主动拆成多个轮次，不因同一小步属于同一功能就一次讲完全部 API。
 - 目录与签名是当前约定；如果发现需要更改，先更新本文，再改代码。框架能编译不表示接口或并发正确性已完成。
 
 ## 2. 要解决的问题、目标与范围
@@ -119,6 +120,7 @@ id 必须是正 int64。成功返回 200，正文直接是上面的 order 对象
 cmd/order/
   main.go                      已有：配置、数据库连接；补一个接入 HTTP 的 TODO
   http.go                      新框架：组装依赖、HTTP 启停与超时
+  http_test.go                  生命周期测试：真实本地 HTTP，验证监听失败、优雅关闭与强制关闭
 internal/database/mysql.go     已有：连接池，不改业务职责
 internal/order/
   model.go                     新框架：请求、商品、订单、结果和错误定义
@@ -148,6 +150,7 @@ migrations/
 - `Store.FindByRequestID`、`Store.FindByID`：通过连接池读取已提交订单。
 - `Store.BeginTx`、`InsertOrder`、`ReadProduct`、`LockInventory`、`DeductInventory`：事务和事务内 SQL；SQL 方法必须显式接收 tx。
 - `runHTTP(signalContext, db)`：构造 store → service → handler → router，运行 HTTP server。
+- `runHTTPServer(signalContext, server)`：同文件内的启停函数，运行监听、接收监听结果、处理退出和请求取消；不拥有数据库连接池。
 
 ## 7. 配置、依赖与迁移
 
@@ -158,6 +161,18 @@ migrations/
 - 信号退出：先 `Shutdown`，用独立 background context 给 5 秒；超时则 `Close` 强制结束连接，并取消服务级 context 以结束在途 SQL。HTTP 退出后才关闭数据库。不要直接把 signalContext 作为请求 BaseContext，否则信号一到就在优雅退出前取消所有请求。
 - 必须接收和处理监听错误；`http.ErrServerClosed` 是预期结束，端口被占用要作为启动失败返回。后台启动 goroutine 的错误通过 channel 传回，不吞错误、不阻塞泄漏。
 - 继续用迁移 CLI，Go 启动不自动迁移。
+
+### 本轮 HTTP 退出实现约定（2026-10-11）
+
+学习者明确要求导师代写退出流程，再对照实际代码分轮学习 goroutine 和 channel。本轮只完成 HTTP 生命周期；地址环境变量和 Server 的读写超时继续保留为后续目标。
+
+- `runHTTP` 保留已有组件组装，调用同文件的 `runHTTPServer`。`main.go` 已由学习者接入 `return runHTTP(signalContext, db)`，数据库仍由 `run` 的 defer 关闭。
+- `runHTTPServer` 为请求创建独立的服务级 context，作为 `Server.BaseContext`；信号 context 只触发关闭，不立即取消在途请求。
+- 使用一个 goroutine 调用 `ListenAndServe`；容量为 1 的 `chan error` 传递唯一一次监听结果，避免关闭过程等待在途请求时，发送方因尚无人接收而阻塞。用 `select` 等待监听结果或退出通知。
+- 监听失败必须返回可分类的错误，并关闭连接、取消服务级 context。退出通知到达后，使用独立的 5 秒 context 调用 `Shutdown`；必须等 `Shutdown` 完成，不能仅因 `ListenAndServe` 返回 `ErrServerClosed` 就让主流程退出。
+- `Shutdown` 失败时取消服务级 context 并调用 `Close`。超时等关闭错误仍向上返回；`Close` 错误及意外监听错误保留在返回错误中。正常的 `ErrServerClosed` 不作为进程失败。
+- 不声称 `Close` 可以强制终止任意 handler；当前 SQL 链路必须响应请求 context，取消后由数据库层清理操作。没有处理 WebSocket 或自行忽略 context 的长期任务。
+- 新增 `cmd/order/http_test.go`，使用测试专用 HTTP handler 和真实本地 TCP，不依赖 MySQL、不写业务数据。验证端口占用会返回错误、优雅退出期间不取消在途请求且等待其结束、5 秒超时后连接关闭且请求 context 取消，以及启动前收到退出通知也能结束。`go test -race ./...` 仅证明执行过的 Go 路径未报告竞争，数据库正确性和真实进程信号仍需另外验收。
 
 版本 2 添加唯一索引 `uq_orders_request_id(request_id)`。执行前在目标开发库检查：
 
@@ -185,6 +200,17 @@ HAVING COUNT(*) > 1;
 5. 对一个确认不存在的 ID 返回 404；非法 ID 返回 400。若要验证 200，先在可丢弃测试商品下插入明确标注的查单测试数据，记录 ID，并在本小步结束删除该测试订单，避免作为真实扣库存订单遗留。
 
 辅助 agent 可拆成两个更短目标，但不能借机把 POST 全部写完。若时间不足，停在 FindByID 编译通过，保留 HTTP 未接入状态即可。
+
+小步 A 的 HTTP 部分进一步拆分如下，每轮只推进一个目标：
+
+- A-3a：只认识 `http.ResponseWriter`，理解响应头、状态码和正文的发送顺序；用最小响应实验验证默认 200 和显式状态码。
+- A-3b：只认识 `*http.Request` 的路径变量读取和 `strconv.ParseInt`；练习把文本 ID 转为 `int64`，暂不接 service。
+- A-3c：只认识 `r.Context()` 和 `context.WithTimeout`；理解请求取消、5 秒预算和 `defer cancel()`，暂不写 JSON。
+- A-3d1：只认识 `encoding/json` 的 `Encoder`；练习将成功订单编码为 JSON 响应，暂不处理错误响应。
+- A-3d2：只认识 `errors.Is` 和安全的错误响应结构；练习把 service 错误映射为 HTTP 状态码和错误 JSON。
+- A-3e：整合前面已理解的部分，完成 `OrderHandler.Get`，再进行非法 ID 和不存在订单的 HTTP 验收。
+
+每个子步骤开始前先确认前置概念；如果学习者不能解释或预测实验结果，就停留在当前子步骤，不继续引入新的标准库 API。
 
 ### 小步 B：唯一约束、校验与重复语义
 
@@ -233,7 +259,7 @@ HAVING COUNT(*) > 1;
 | 同键不同参数并发 | 库存足够，同键、不同 quantity | 一个成功订单；另一参数得到 409；只按赢家数量扣一次 | 未执行 |
 | 1000 个不同键 | 库存 100，每次购买 1；先用 20 个并发客户端持续发出 1000 次请求 | 恰好 100 个 201、900 个库存不足；100 笔订单、库存 0、无负库存；无意外 5xx | 未执行 |
 | 编译、静态检查、race | go build ./...；go vet ./...；实现集成实验后 go test -race ./... | 通过，注明执行过哪些测试；没有测试时不能称并发验收通过 | 未执行 |
-| HTTP 生命周期 | 端口冲突启动；正常请求时 SIGTERM；必要时关闭超时 | 启动错误可见；按预算退出；先停止 HTTP 再关闭池 | 未执行 |
+| HTTP 生命周期 | 端口冲突启动；正常请求时 SIGTERM；必要时关闭超时 | 启动错误可见；按预算退出；先停止 HTTP 再关闭池 | 2026-10-11 本地真实 HTTP 测试通过：端口冲突、context 触发优雅退出、5 秒超时强制关闭、启动前取消；race 无报告。真实进程 SIGTERM 和 MySQL 关闭顺序尚未运行验收 |
 
 1000 次实验首先测试总量，用有界并发排除排队超时的干扰；再逐渐提高并发，记录延迟和 503。出现超时要分析连接池/锁等待，不能把 503 算作库存不足，也不能为得到预期数字忽略异常。
 
@@ -243,14 +269,35 @@ HAVING COUNT(*) > 1;
 
 - [x] 本设计文档：业务顺序、文件边界、实施步骤、失败行为和实验约定。
 - [x] Go 框架落盘、格式化、编译及静态检查。
+- [x] 小步 A 子步骤：`Store.FindByID` 已实现参数化查询、`Scan` 映射、查无记录和存储错误分类。
+- [x] 小步 A 子步骤：`Service.Get` 已实现正 ID 校验，并向上透传查单结果和存储错误。
+- [x] 小步 A 子步骤：`OrderHandler.Get` 已实现路径 ID 解析、5 秒请求超时、成功 JSON 和安全错误映射。
+- [x] 小步 A 子步骤：`runHTTP` 已组装并由 `main.go` 接入；`runHTTPServer` 实现监听结果传递、退出通知、优雅关闭和超时强制关闭，并通过本地 HTTP 生命周期测试。
+- [ ] `HTTP_ADDR` 环境变量、Server 的读写和空闲超时配置。
 - [ ] 版本 2 SQL 编写与迁移。
-- [ ] GET 实现与验收。
+- [ ] GET 真实 MySQL 运行时验收；HTTP 已接入启动流程。
 - [ ] POST、事务、行锁、唯一键和重复语义实现。
 - [ ] 数据库与 HTTP 实验执行，填写第 9 节实际结果。
 
 目前成功下单、查单、幂等和并发正确性均为设计约定，不是已实现事实。最终完成时逐项更新，保留尚未通过的实验和原因。
 
 2026-10-09 框架交付记录：新增 http.go、order 包三个文件、httpapi 包两个文件；main.go 只补接入 TODO，保留已验收的数据库启动行为。gofmt、go build ./...、go vet ./...、go test ./... 通过；当前无测试文件，go test 只说明包能编译，不代表功能、事务或并发验收通过。沙箱默认 Go 缓存目录不可写，使用 `GOCACHE=/private/tmp/flash-order-review-go-cache GOFLAGS=-buildvcs=false` 完成检查。未执行迁移、未修改数据库内容；HTTP 尚未接入启动流程，两个 handler 仍为 501 占位。
+
+2026-10-09 小步 A-1 进度：学习者完成 `internal/order/store.go` 中的 `Store.FindByID`。实现使用显式字段和 `?` 参数占位符，通过 `QueryRowContext` 传递请求 context，并用 `Scan` 写入 `Order`；`sql.ErrNoRows` 转为 `ErrOrderNotFound`，其他错误归类为 `ErrStorageUnavailable`，成功返回订单。已运行 gofmt 和 `GOCACHE=/private/tmp/flash-order-review-go-cache GOFLAGS=-buildvcs=false go test ./...`，检查通过；当前无测试文件，尚未执行真实 MySQL 查询，因此查单运行时验收仍未完成。下一步为小步 A-2：实现 `Service.Get` 的正 ID 校验和错误透传。
+
+2026-10-09 小步 A-2 进度：学习者完成 `internal/order/service.go` 中的 `Service.Get`。实现对 `id <= 0` 返回 `ErrInvalidInput`，合法 ID 透传同一个 context 调用 `Store.FindByID`，并将订单或错误返回给上层；未引入 HTTP 类型或数据库职责。已运行 gofmt 和 `GOCACHE=/private/tmp/flash-order-review-go-cache GOFLAGS=-buildvcs=false go test ./...`，检查通过；当前仍无运行时数据库测试，GET HTTP handler、服务启动接入和 400/404 验收尚未完成。
+
+2026-10-11 小步 A-3 进度：完成 `internal/httpapi/order.go` 的 `OrderHandler.Get`。实现路径 ID 解析和正数校验、从请求 context 派生 5 秒超时、成功订单 JSON，以及通过 `errors.Is` 将领域错误映射为安全的 HTTP JSON 错误；非法 ID 写响应后立即返回，未向客户端暴露原始数据库错误。已运行 gofmt 和 `GOCACHE=/private/tmp/flash-order-review-go-cache GOFLAGS=-buildvcs=false go test ./...`，检查通过；尚未接入 `runHTTP`，因此没有执行真实 HTTP 或 MySQL 运行时验收。
+
+2026-10-11 小步 A-4 退出进度：学习者已完成 `runHTTP` 的对象组装、监听调用及 `main.go` 接入；本次明确授权导师完成退出流程。新增同文件 `runHTTPServer`，使用独立服务级 context、容量为 1 的监听结果通道、监听 goroutine 和 select；退出时等待独立 5 秒预算的 Shutdown，失败则取消在途请求并 Close，收取监听结果后返回。新增 `cmd/order/http_test.go`，四项真实本地 HTTP 测试覆盖监听失败错误保留、等待在途请求正常完成、5 秒超时后请求取消和连接关闭、启动前取消。
+
+本轮验证：gofmt、`go build ./...`、`go vet ./...`、`git diff --check` 和 `go test -race ./...` 通过，Go 命令使用 `GOCACHE=/private/tmp/flash-order-review-go-cache GOFLAGS=-buildvcs=false`。首次 race 测试因沙箱禁止绑定本地端口失败；经执行授权后重跑通过（cmd/order 用时 6.200 秒），并非代码测试失败被忽略。没有访问 MySQL、执行迁移或写入测试订单；未验证真实 SQL 取消或操作系统 SIGTERM。HTTP_ADDR 和 Server 读写超时仍留有 TODO，POST 保持 501。
+
+学习停点：学习者理解了匿名函数和 goroutine 使监听与退出控制并发推进，正在学习通道发送/接收；有缓冲通道和 select 仍需对照实际代码逐轮讲解。下一轮先看 `listenErr := make(chan error, 1)` 和监听 goroutine，再看 select，最后解释 Shutdown 与服务级 context；不一次讲完整个函数。
+
+2026-10-12 提交前进度：学习者确认已经理解目前所有代码，包括 HTTP 生命周期中的 goroutine、通道、select、Shutdown 和服务级 context；上一条记录中的语法学习停点已完成。提交前重新运行 gofmt 格式检查、go build ./...、go vet ./...、git diff --check 和 go test -race -count=1 ./...，全部通过；四项 HTTP 生命周期测试实际执行，cmd/order 用时 6.668 秒，其他包尚无测试文件。未访问 MySQL、执行迁移或写入业务数据，真实查单与进程信号验收仍未完成。
+
+下一小步：完成查单阶段的运行验收。先按第 7 节手写 HTTP_ADDR 和 Server 超时配置，再检查实际 MySQL 环境，验证 GET 的 400/404/200、服务重启后的查单，以及真实 SIGTERM 下 HTTP 与数据库的关闭顺序。完成后再进入版本 2 唯一约束，不直接开始整条 POST 实现。
 
 ## 11. 参考
 

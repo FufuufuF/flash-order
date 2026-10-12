@@ -12,8 +12,18 @@ func NewService(store *Store) *Service {
 
 // Get 完成按 ID 查单。业务层不接收 http.ResponseWriter。
 func (s *Service) Get(ctx context.Context, id int64) (Order, error) {
-	// TODO(002，小步 A)：校验正 ID，调用 store.FindByID，返回结果或错误。
-	return Order{}, ErrNotImplemented
+	// 校验正 ID，调用 store.FindByID，返回结果或错误。
+	if id <= 0 {
+		return Order{}, ErrInvalidInput
+	}
+
+	result, err := s.store.FindByID(ctx, id)
+
+	if err != nil {
+		return Order{}, err
+	}
+
+	return result, nil
 }
 
 // Create 负责业务判断和事务边界。所有事务内查询必须传递同一个 tx。
