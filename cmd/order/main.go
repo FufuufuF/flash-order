@@ -24,7 +24,12 @@ func main() {
 }
 
 func run() (runErr error) {
-	cfg, err := loadConfig()
+	dbCfg, err := loadMySqlConfig()
+	if err != nil {
+		return err
+	}
+
+	httpCfg, err := loadHTTPConfig()
 	if err != nil {
 		return err
 	}
@@ -33,7 +38,7 @@ func run() (runErr error) {
 	defer stopSignals()
 
 	startupContext, cancelStartup := context.WithTimeout(signalContext, 3*time.Second)
-	db, err := database.Open(startupContext, cfg)
+	db, err := database.Open(startupContext, dbCfg)
 	cancelStartup()
 	if err != nil {
 		return err
@@ -53,10 +58,25 @@ func run() (runErr error) {
 
 	slog.Info("database_connected")
 
-	return runHTTP(signalContext, db)
+	return runHTTP(signalContext, db, httpCfg)
 }
 
-func loadConfig() (database.Config, error) {
+func loadHTTPConfig() (HTTPConfig, error) {
+	addr := os.Getenv("HTTP_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:8080"
+	}
+
+	return HTTPConfig{
+		Addr:              addr,
+		ReadHeaderTimeout: 3 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}, nil
+}
+
+func loadMySqlConfig() (database.Config, error) {
 	host := os.Getenv("MYSQL_HOST")
 	if host == "" {
 		host = "127.0.0.1"

@@ -2,12 +2,21 @@
 
 ## 1. 文档状态与学习约定
 
-- 状态：设计已确定；框架、查单代码和 HTTP 启停已实现，HTTP 生命周期本地测试通过；下单业务、部分 Server 配置和真实数据库验收待完成。
+- 状态：设计已确定；框架、查单代码、HTTP 配置和启停已实现，HTTP 生命周期本地测试通过；学习者反馈真实 MySQL 连接启动及 GET 非法 ID 的 400 响应符合预期，其余查单验收暂缓；下单业务待完成。
 - 前置阶段：`001-database-bootstrap.md`。已有数据库连接、退出清理和版本 1 三张表。
 - 本文承接最近讨论：本阶段直接实现事务、`SELECT ... FOR UPDATE` 和 request_id 唯一约束，不再从无并发保护的版本开始。
 - 学习者亲手实现 TODO。辅助 agent 每次只指导一个小步骤：解释问题和取舍，给函数签名、伪代码或关键 SQL，等待学习者尝试，再审查。未经明确授权，不补齐整条链路或生成完整文件。
 - 教学粒度补充：一个教学轮次只引入一个主要知识点或一组紧密相关的 API。先解释用途、输入输出和一个最小例子，再让学习者用自己的话复述或预测行为；确认理解后才进入下一个知识点或要求写代码。遇到 HTTP、事务、并发等密集章节，主动拆成多个轮次，不因同一小步属于同一功能就一次讲完全部 API。
 - 目录与签名是当前约定；如果发现需要更改，先更新本文，再改代码。框架能编译不表示接口或并发正确性已完成。
+- 会话分工（2026-10-12）：主线管理会话只负责串联阶段、维护交接进度和代码 review；具体开发与教学在学习者另开的专项会话中进行。专项会话按第 12 节辅导，学习者亲手实现；阶段结束更新本文，由学习者回主线会话发起 review。这是角色分工，不把所有新会话限制为只做 review。
+
+### 当前接手摘要（2026-10-12）
+
+- 已实现：GET 查单代码、HTTP_ADDR 和四项 Server 超时配置、HTTP 启停与数据库连接池关闭流程。最近的 build、vet 和四项 HTTP 生命周期 race 测试通过，详见第 10 节。
+- 学习者反馈：MySQL 容器 healthy，宿主机映射 127.0.0.1:3306；应用连接启动和 GET /orders/abc 的 400 响应符合预期。运行环境仍需在接手时重新核对。
+- 暂缓验收：GET 404/200、重启后的查单和真实 SIGTERM 下的关闭顺序。学习者已明确选择先进入下单实现，不重复把这些项目设为本轮前置任务，也不记录为通过。
+- 下一小目标：小步 B1，request_id 唯一约束的版本 2 迁移。重复数据预检查尚无执行结果，两个 000002 SQL 文件尚未创建；先核对实际代码及数据库版本，再指导学习者完成这一小步。POST 与下单 Service 仍为占位实现，不能直接宣称接口可用。
+- 新专项会话先读根目录 AGENTS.md、本文第 10 节最新记录和第 12 节教学约定，再用 git status/git diff 核对实际进度。旧记录中的“下一步”代表当时停点；当前入口以本摘要和最新记录为准。每次只推进一个 60–90 分钟内可完成的小目标，结束时回填实现、验证和遗留项。
 
 ## 2. 要解决的问题、目标与范围
 
@@ -118,8 +127,8 @@ id 必须是正 int64。成功返回 200，正文直接是上面的 order 对象
 
 ```text
 cmd/order/
-  main.go                      已有：配置、数据库连接；补一个接入 HTTP 的 TODO
-  http.go                      新框架：组装依赖、HTTP 启停与超时
+  main.go                      加载数据库及 HTTP 配置、管理数据库连接池、接入 HTTP
+  http.go                      HTTPConfig、组装依赖、HTTP 启停与超时
   http_test.go                  生命周期测试：真实本地 HTTP，验证监听失败、优雅关闭与强制关闭
 internal/database/mysql.go     已有：连接池，不改业务职责
 internal/order/
@@ -149,7 +158,8 @@ migrations/
 - `validateInput(input)`、`replay(existing, input)`：纯校验与重复参数比较。
 - `Store.FindByRequestID`、`Store.FindByID`：通过连接池读取已提交订单。
 - `Store.BeginTx`、`InsertOrder`、`ReadProduct`、`LockInventory`、`DeductInventory`：事务和事务内 SQL；SQL 方法必须显式接收 tx。
-- `runHTTP(signalContext, db)`：构造 store → service → handler → router，运行 HTTP server。
+- `loadHTTPConfig() (HTTPConfig, error)`：读取 HTTP_ADDR 并提供默认地址和固定超时。
+- `runHTTP(signalContext, db, cfg HTTPConfig)`：构造 store → service → handler → router，按传入配置运行 HTTP server。
 - `runHTTPServer(signalContext, server)`：同文件内的启停函数，运行监听、接收监听结果、处理退出和请求取消；不拥有数据库连接池。
 
 ## 7. 配置、依赖与迁移
@@ -161,6 +171,18 @@ migrations/
 - 信号退出：先 `Shutdown`，用独立 background context 给 5 秒；超时则 `Close` 强制结束连接，并取消服务级 context 以结束在途 SQL。HTTP 退出后才关闭数据库。不要直接把 signalContext 作为请求 BaseContext，否则信号一到就在优雅退出前取消所有请求。
 - 必须接收和处理监听错误；`http.ErrServerClosed` 是预期结束，端口被占用要作为启动失败返回。后台启动 goroutine 的错误通过 channel 传回，不吞错误、不阻塞泄漏。
 - 继续用迁移 CLI，Go 启动不自动迁移。
+
+### 本轮 HTTP 配置补齐约定（2026-10-12）
+
+学习者已新增 `HTTPConfig` 和 `loadHTTPConfig`，并明确授权导师补齐本轮配置，尤其修复时间单位。实现前先补充本约定；范围限于配置类型、加载、传递和 Server 字段，不推进 POST、数据库迁移或真实 MySQL 验收。
+
+- 问题：整数直接转为 `time.Duration` 时按纳秒解释，例如 `time.Duration(10)` 为 10 纳秒，会造成几乎立即超时。四个超时字段直接使用 `time.Duration`，加载时使用 `time.Second` 表达单位，传给 Server 时不再转换。
+- `cmd/order/http.go` 定义 `HTTPConfig`：`Addr string`，以及 `ReadHeaderTimeout`、`ReadTimeout`、`WriteTimeout`、`IdleTimeout` 四个 `time.Duration` 字段。配置对象只保存数据；`runHTTP` 使用它，不自行读取环境变量。
+- `cmd/order/main.go` 实现 `loadHTTPConfig() (HTTPConfig, error)`，沿用学习者已有签名。本轮只有环境读取和默认值，返回配置及 nil；HTTP_ADDR 未设置或为空时使用 `127.0.0.1:8080`，非空则原样使用。四个固定超时依次为 3 秒、10 秒、10 秒、60 秒，不增加新的环境变量或依赖。
+- `run` 先加载数据库配置及 HTTP 配置，再建立数据库连接池；分别使用 `dbCfg`、`httpCfg`，调用 `runHTTP(signalContext, db, httpCfg)`。连接池仍由 `run` 关闭，HTTP 退出管理沿用现有实现。
+- 失败行为：数据库配置加载失败沿用现有启动失败语义；非法 HTTP 地址或端口占用由已有监听错误路径返回，随后关闭数据库连接池，不把监听失败当作正常启动。
+- 实现顺序：先更新设计 → 修改字段类型并直接映射到 Server → 补齐配置加载和调用参数 → gofmt → 编译、静态检查和已有 HTTP 生命周期 race 测试 → 记录实际结果。
+- 本轮验收：核对四个时长均明确带单位、默认地址分支和自定义地址透传；`go build ./...`、`go vet ./...`、`git diff --check`、`go test -race -count=1 ./...` 通过。已有生命周期测试只验证本地 HTTP 路径；默认/自定义地址的实际监听、GET 400/404/200、重启查单及真实 SIGTERM 与 MySQL 关闭顺序，仍留给下一轮运行验收。
 
 ### 本轮 HTTP 退出实现约定（2026-10-11）
 
@@ -258,7 +280,9 @@ HAVING COUNT(*) > 1;
 | 同键抢最后一件 | 库存 1，同键同参数 20 次并发 | 一次 201，其余 200；一个订单 ID、库存 0；不能返回库存不足 | 未执行 |
 | 同键不同参数并发 | 库存足够，同键、不同 quantity | 一个成功订单；另一参数得到 409；只按赢家数量扣一次 | 未执行 |
 | 1000 个不同键 | 库存 100，每次购买 1；先用 20 个并发客户端持续发出 1000 次请求 | 恰好 100 个 201、900 个库存不足；100 笔订单、库存 0、无负库存；无意外 5xx | 未执行 |
-| 编译、静态检查、race | go build ./...；go vet ./...；实现集成实验后 go test -race ./... | 通过，注明执行过哪些测试；没有测试时不能称并发验收通过 | 未执行 |
+| 编译、静态检查、race | go build ./...；go vet ./...；实现集成实验后 go test -race ./... | 通过，注明执行过哪些测试；没有测试时不能称并发验收通过 | 2026-10-12 配置补齐后 build、vet 和 go test -race -count=1 ./... 通过；执行了四项 HTTP 生命周期测试，尚无数据库业务测试 |
+| HTTP 配置 | 核对加载、时长单位和 Server 映射；运行时分别使用默认及自定义地址 | 地址按配置监听；四个超时为 3s/10s/10s/60s | 2026-10-12 代码核对与编译通过：默认地址、非空地址透传、time.Duration 字段和 time.Second 赋值已实现；学习者按指导显式设置 127.0.0.1:8080，反馈服务启动和 GET 非法 ID 响应符合预期；未单独验证未设置地址的默认分支、其他地址和慢连接超时 |
+| 查单运行初验 | 使用应用用户配置启动服务，GET /orders/abc | database_connected；HTTP 400 和 invalid_input JSON | 2026-10-12 学习者反馈全部符合预期；导师未独立复测。该请求不执行订单 SQL，GET 404/200、重启持久化和真实 SIGTERM 由学习者选择暂缓 |
 | HTTP 生命周期 | 端口冲突启动；正常请求时 SIGTERM；必要时关闭超时 | 启动错误可见；按预算退出；先停止 HTTP 再关闭池 | 2026-10-11 本地真实 HTTP 测试通过：端口冲突、context 触发优雅退出、5 秒超时强制关闭、启动前取消；race 无报告。真实进程 SIGTERM 和 MySQL 关闭顺序尚未运行验收 |
 
 1000 次实验首先测试总量，用有界并发排除排队超时的干扰；再逐渐提高并发，记录延迟和 503。出现超时要分析连接池/锁等待，不能把 503 算作库存不足，也不能为得到预期数字忽略异常。
@@ -273,13 +297,13 @@ HAVING COUNT(*) > 1;
 - [x] 小步 A 子步骤：`Service.Get` 已实现正 ID 校验，并向上透传查单结果和存储错误。
 - [x] 小步 A 子步骤：`OrderHandler.Get` 已实现路径 ID 解析、5 秒请求超时、成功 JSON 和安全错误映射。
 - [x] 小步 A 子步骤：`runHTTP` 已组装并由 `main.go` 接入；`runHTTPServer` 实现监听结果传递、退出通知、优雅关闭和超时强制关闭，并通过本地 HTTP 生命周期测试。
-- [ ] `HTTP_ADDR` 环境变量、Server 的读写和空闲超时配置。
+- [x] `HTTP_ADDR` 环境变量、Server 的读写和空闲超时配置；学习者反馈显式配置地址的启动及 400 响应符合预期，其他地址与慢连接超时尚未运行验证。
 - [ ] 版本 2 SQL 编写与迁移。
-- [ ] GET 真实 MySQL 运行时验收；HTTP 已接入启动流程。
+- [ ] GET 真实 MySQL 完整运行验收；应用连接启动和非法 ID 的 400 已由学习者反馈通过，404/200、重启持久化和真实 SIGTERM 暂缓。
 - [ ] POST、事务、行锁、唯一键和重复语义实现。
 - [ ] 数据库与 HTTP 实验执行，填写第 9 节实际结果。
 
-目前成功下单、查单、幂等和并发正确性均为设计约定，不是已实现事实。最终完成时逐项更新，保留尚未通过的实验和原因。
+目前查单代码已实现，但真实 MySQL 运行验收尚未完成；成功下单、幂等和并发正确性仍为设计约定，不是已实现事实。最终完成时逐项更新，保留尚未通过的实验和原因。
 
 2026-10-09 框架交付记录：新增 http.go、order 包三个文件、httpapi 包两个文件；main.go 只补接入 TODO，保留已验收的数据库启动行为。gofmt、go build ./...、go vet ./...、go test ./... 通过；当前无测试文件，go test 只说明包能编译，不代表功能、事务或并发验收通过。沙箱默认 Go 缓存目录不可写，使用 `GOCACHE=/private/tmp/flash-order-review-go-cache GOFLAGS=-buildvcs=false` 完成检查。未执行迁移、未修改数据库内容；HTTP 尚未接入启动流程，两个 handler 仍为 501 占位。
 
@@ -298,6 +322,18 @@ HAVING COUNT(*) > 1;
 2026-10-12 提交前进度：学习者确认已经理解目前所有代码，包括 HTTP 生命周期中的 goroutine、通道、select、Shutdown 和服务级 context；上一条记录中的语法学习停点已完成。提交前重新运行 gofmt 格式检查、go build ./...、go vet ./...、git diff --check 和 go test -race -count=1 ./...，全部通过；四项 HTTP 生命周期测试实际执行，cmd/order 用时 6.668 秒，其他包尚无测试文件。未访问 MySQL、执行迁移或写入业务数据，真实查单与进程信号验收仍未完成。
 
 下一小步：完成查单阶段的运行验收。先按第 7 节手写 HTTP_ADDR 和 Server 超时配置，再检查实际 MySQL 环境，验证 GET 的 400/404/200、服务重启后的查单，以及真实 SIGTERM 下 HTTP 与数据库的关闭顺序。完成后再进入版本 2 唯一约束，不直接开始整条 POST 实现。
+
+2026-10-12 HTTP 配置补齐进度：学习者提出用 `HTTPConfig` 集中配置、由 main 加载并传给 runHTTP，随后明确授权导师补齐剩余实现和修复时间单位。先补充第 6/7 节约定，再修改 `cmd/order/http.go`：四个超时字段改为 `time.Duration`，Server 直接使用字段；修改 `cmd/order/main.go`：补齐 HTTP_ADDR 默认值和 3s/10s/10s/60s 固定超时，在 run 中加载并传递 httpCfg，数据库配置使用 dbCfg 区分。保留学习者已有 `loadHTTPConfig() (HTTPConfig, error)` 签名，本轮返回 nil 错误。
+
+验证结果：gofmt、go build ./...、go vet ./...、git diff --check 通过。`GOCACHE=/private/tmp/flash-order-review-go-cache GOFLAGS=-buildvcs=false go test -race -count=1 ./...` 首次因沙箱禁止绑定本地端口而失败；放宽执行限制后重跑通过，cmd/order 用时 6.203 秒，四项已有 HTTP 生命周期测试执行成功且 race 无报告，其他包尚无测试文件。本轮没有新增测试，默认/自定义地址和时长的结论来自代码核对，不能代替实际监听验证。未访问 MySQL、写入测试订单或执行版本 2 迁移；真实 GET、重启查询和进程 SIGTERM 的验收继续保留为待完成。
+
+学习交接：已解释整数转为 time.Duration 按纳秒计数，以及带单位的时长在配置中直接传递的原因；学习者尚未反馈对修复代码的理解。下一次从检查 Docker/MySQL 实际运行环境开始，按小步 A 完成查单运行验收，通过后记录结果并清理临时订单。
+
+2026-10-12 运行验收环境进度：学习者亲手执行 Compose up 和 ps，反馈 `flash-order-dev-mysql-1` 使用 mysql:8.4，状态为 healthy，端口为 `127.0.0.1:3306 -> 3306/tcp`。这确认了容器健康状态与端口映射，尚未证明 Go 应用的连接配置、orders 表或查单结果。导师只核对本机配置文件中的变量名称：MYSQL_PORT、MYSQL_ROOT_PASSWORD、MYSQL_DATABASE、MYSQL_USER、MYSQL_PASSWORD；没有输出配置值。下一操作由学习者加载应用环境、编译到临时目录并直接运行程序，观察 database_connected，再从另一终端验证非法订单 ID 的 HTTP 400；该请求不会查询 orders 表，404/200 与真实 SIGTERM 验收仍待执行。
+
+2026-10-12 学习节奏调整：学习者反馈应用启动日志及 GET /orders/abc 的响应全部符合预期，并明确选择本轮先测试到这里，继续实现下单接口。按学习者最新要求，剩余查单验收暂缓，不能记录为通过；应用连接检查和 400 路径也不能证明 orders 查询、持久化或真实进程退出已经验收。本轮没有插入查单测试订单。后续按既定小步 B 开始：先检查目标库现有 request_id 重复数据，再由学习者手写版本 2 up/down 唯一索引 SQL，导师审查后执行迁移，用回滚测试事务观察重复键。该学习节奏调整不取消最终验收项目，也未授权导师代写后续业务 TODO；下一轮先讨论唯一约束的作用边界，指导重复数据预检查。
+
+2026-10-12 会话职责调整：学习者明确要求本会话只串联管理主线和做代码 review，具体开发及教学转移到另开的专项会话。为支持直接用本文交接，新增第 1 节会话分工和当前接手摘要，保留第 12 节教学指引；新专项会话从 B1 开始，并在结束时更新本文，供主线 review 核对。本轮仅整理交接文档，没有继续实现业务或执行迁移。
 
 ## 11. 参考
 

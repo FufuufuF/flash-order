@@ -14,18 +14,29 @@ import (
 	"github.com/FufuufuF/flash-order/internal/order"
 )
 
+type HTTPConfig struct {
+	Addr              string
+	ReadHeaderTimeout time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	IdleTimeout       time.Duration
+}
+
 // runHTTP 负责组装对象和管理 HTTP 生命周期，不在这里编写下单业务。
-func runHTTP(signalContext context.Context, db *sql.DB) error {
+func runHTTP(signalContext context.Context, db *sql.DB, cfg HTTPConfig) error {
 	orderStore := order.NewStore(db)
 	orderService := order.NewService(orderStore)
 	orderHandler := httpapi.NewOrderHandler(orderService)
 
 	router := httpapi.NewRouter(orderHandler)
 
-	// TODO(002，后续小步)：读取 HTTP_ADDR，并设置 Server 的读写和空闲超时。
 	server := &http.Server{
-		Addr:    "127.0.0.1:8080",
-		Handler: router,
+		Addr:              cfg.Addr,
+		Handler:           router,
+		ReadTimeout:       cfg.ReadTimeout,
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		WriteTimeout:      cfg.WriteTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
 	}
 
 	return runHTTPServer(signalContext, server)
