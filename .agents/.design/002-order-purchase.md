@@ -2,7 +2,7 @@
 
 ## 1. 文档状态与学习约定
 
-- 状态：设计已确定；框架、查单代码、HTTP 配置和启停已实现，HTTP 生命周期本地测试通过；学习者反馈真实 MySQL 连接启动及 GET 非法 ID 的 400 响应符合预期，其余查单验收暂缓；下单业务待完成。
+- 状态：设计已确定；框架、查单代码、HTTP 配置和启停已实现，HTTP 生命周期本地测试通过；版本 2 唯一索引迁移已应用并验收，回滚事务中的重复插入实验待执行；学习者反馈真实 MySQL 连接启动及 GET 非法 ID 的 400 响应符合预期，其余查单验收暂缓；下单业务待完成。
 - 前置阶段：`001-database-bootstrap.md`。已有数据库连接、退出清理和版本 1 三张表。
 - 本文承接最近讨论：本阶段直接实现事务、`SELECT ... FOR UPDATE` 和 request_id 唯一约束，不再从无并发保护的版本开始。
 - 学习者亲手实现 TODO。辅助 agent 每次只指导一个小步骤：解释问题和取舍，给函数签名、伪代码或关键 SQL，等待学习者尝试，再审查。未经明确授权，不补齐整条链路或生成完整文件。
@@ -10,12 +10,13 @@
 - 目录与签名是当前约定；如果发现需要更改，先更新本文，再改代码。框架能编译不表示接口或并发正确性已完成。
 - 会话分工（2026-10-12）：主线管理会话只负责串联阶段、维护交接进度和代码 review；具体开发与教学在学习者另开的专项会话中进行。专项会话按第 12 节辅导，学习者亲手实现；阶段结束更新本文，由学习者回主线会话发起 review。这是角色分工，不把所有新会话限制为只做 review。
 
-### 当前接手摘要（2026-10-12）
+### 当前接手摘要（2026-10-13）
 
 - 已实现：GET 查单代码、HTTP_ADDR 和四项 Server 超时配置、HTTP 启停与数据库连接池关闭流程。最近的 build、vet 和四项 HTTP 生命周期 race 测试通过，详见第 10 节。
 - 学习者反馈：MySQL 容器 healthy，宿主机映射 127.0.0.1:3306；应用连接启动和 GET /orders/abc 的 400 响应符合预期。运行环境仍需在接手时重新核对。
 - 暂缓验收：GET 404/200、重启后的查单和真实 SIGTERM 下的关闭顺序。学习者已明确选择先进入下单实现，不重复把这些项目设为本轮前置任务，也不记录为通过。
-- 下一小目标：小步 B1，request_id 唯一约束的版本 2 迁移。重复数据预检查尚无执行结果，两个 000002 SQL 文件尚未创建；先核对实际代码及数据库版本，再指导学习者完成这一小步。POST 与下单 Service 仍为占位实现，不能直接宣称接口可用。
+- B1 实际进度：按学习者明确授权完成两个版本 2 SQL 文件及迁移，版本 1 未修改。预检查确认目标开发库 flash_order、版本 1 非 dirty、orders=0 且无重复；migrate up 1 成功应用版本 2，CLI 与数据库新查询确认 version=2、dirty=0、uq_orders_request_id(request_id) 存在且 Non_unique=0，订单数仍为 0。重复插入与回滚清理实验继续待执行，未把 B1 全部记录为通过。
+- 当前教学停点：2026-10-13 学习者明确授权导师第三次 review 后直接修正 Create/Store 与 if 嵌套。学习者已先修正 ReadProduct 两列映射；导师现已将 Create 主流程展开、InsertOrder 前移至商品/库存检查前、时间统一 UTC/微秒，补齐重复键显式回滚后重查/replay、回滚失败的安全日志与依赖错误、重查意外无单的 ErrInvariantViolation；保留正确的 Commit/ErrCommitUnknown 边界。Store.InsertOrder 用 MySQL 1062+完整索引名后缀分类 request_id 冲突并保留 cause；LockInventory 只将无行归为 ErrInventoryMissing，其他错误归为 ErrStorageUnavailable。build/vet/差异检查及临时 driver 的 35 个模拟子用例（-race）通过，临时文件已清理；这些只验证 Go 逻辑，不证明真实 SQL/行锁/并发正确性。按学习者最新指示，本轮未使用真实开发库验证、未写测试业务数据。当前 C1/B3/C2/C3 的对应代码已补齐，运行验收仍待完成；下一停点为学习者对照未暂存差异理解分支与 errors.As/Is。POST、B1 重复插入回滚实验、真实下单/并发验收和暂缓 GET 项继续待执行。历史 DeductInventory 三个真实 MySQL 局部测试证据保留，见第 10 节。
 - 新专项会话先读根目录 AGENTS.md、本文第 10 节最新记录和第 12 节教学约定，再用 git status/git diff 核对实际进度。旧记录中的“下一步”代表当时停点；当前入口以本摘要和最新记录为准。每次只推进一个 60–90 分钟内可完成的小目标，结束时回填实现、验证和遗留项。
 
 ## 2. 要解决的问题、目标与范围
@@ -140,12 +141,14 @@ internal/httpapi/
   order.go                     新框架：解析 HTTP、调用 service、输出 JSON
 migrations/
   000001_...up/down.sql         已应用，不修改
-  000002_add_request_id_unique.up.sql    后续手写：添加唯一索引
-  000002_add_request_id_unique.down.sql  后续手写：移除这个索引
+  000002_add_request_id_unique.up.sql    已应用版本 2：添加唯一索引
+  000002_add_request_id_unique.down.sql  已编写：移除这个索引，尚未执行
 .agents/.design/002-order-purchase.md
 ```
 
 `order` 是一个包，三个文件协作；service 做判断和事务编排，store 执行 SQL。当前用具体类型连接，暂不为每张表抽接口，不增加 ORM 或通用框架。
+
+事务边界说明（2026-10-12）：当前 order.Store 围绕下单业务访问 products、inventory 和 orders，不要求每张表各建一个 Store。BeginTx 是调用已有连接池事务 API 的薄入口，放在 order 包不会限制事务只能操作 orders；Service 负责开一次事务并将同一 tx 传给相关 SQL 方法。未来若在同一服务内拆多个 Store，可以集中一个事务入口，各 Store 参与同一事务，无须每个复制 BeginTx；本轮不引入新的公共事务组件。InsertOrder 的显式 tx 参数来自“订单与库存共同提交/回滚”的业务约定，调用实现必须使用 tx.ExecContext。它不代表 INSERT/UPDATE/DELETE 一律要手动开启事务；本项目 InnoDB 默认自动提交的单条写入可以独立执行，但独立提交的订单不能被下单事务的 Rollback 撤销。
 
 框架中构造函数、类型、路由注册可以完整提供；业务方法返回 `ErrNotImplemented`，HTTP handler 返回 501。`main.go` 在学习者完成 HTTP 生命周期前仍保留现有“连接数据库后等待信号”的行为。不得把占位返回值作为成功结果。
 
@@ -156,6 +159,7 @@ migrations/
 - `Service.Create(ctx, input)`：整个下单流程；返回订单和是否重放。
 - `Service.Get(ctx, id)`：按订单 ID 查单。
 - `validateInput(input)`、`replay(existing, input)`：纯校验与重复参数比较。
+- `validRequestID(id string) bool`：学习者新增的纯校验辅助函数，按字节检查 1–64 个 ASCII 字符及字母/数字/连字符/下划线白名单，由 validateInput 调用；不改写请求键。
 - `Store.FindByRequestID`、`Store.FindByID`：通过连接池读取已提交订单。
 - `Store.BeginTx`、`InsertOrder`、`ReadProduct`、`LockInventory`、`DeductInventory`：事务和事务内 SQL；SQL 方法必须显式接收 tx。
 - `loadHTTPConfig() (HTTPConfig, error)`：读取 HTTP_ADDR 并提供默认地址和固定超时。
@@ -207,6 +211,14 @@ HAVING COUNT(*) > 1;
 
 有重复数据就停止，说明冲突并由学习者决定如何处理；不静默删单，也不能用 force 跳过失败。up 只增加该索引，down 只删除该索引。查验版本 2 且非 dirty，并用 SHOW INDEX 确认唯一性。version 1 已应用，不能直接修改它代替新迁移。
 
+### 本轮 B1 SQL 代写约定（2026-10-12）
+
+学习者明确要求导师完成两个版本 2 SQL 文件，随后自行阅读熟悉语法。本次授权只覆盖第 6 节约定的 up/down 文件，不扩展到 Go 业务实现或执行迁移。先补充本约定，再创建文件：up 使用 ALTER TABLE orders ADD UNIQUE INDEX uq_orders_request_id (request_id)，down 使用 ALTER TABLE orders DROP INDEX uq_orders_request_id，均以分号终止；版本 1 保留原样。静态审查两文件的表名、索引名、作用范围及 SQL 语法，并检查差异格式。重复数据预检查、实际迁移和回滚事务实验仍待学习者继续，不能把文件完成记为数据库约束已生效。
+
+### 本轮 B1 迁移执行约定（2026-10-12）
+
+学习者随后反馈数据库完全没有数据，并明确表示可以直接迁移，本次授权扩展到执行版本 2。应用启动仍不执行迁移，使用既有独立 CLI。先只读核对目标开发库、schema_migrations 的版本/dirty、orders 数量、重复数据及现有索引；若版本不是 1、处于 dirty 或发现重复，停止并检查实际状态。预检查通过后使用 /Users/royce/go/bin/migrate -path ./migrations -database <本机开发 URL> up 1，只执行下一个版本 2；从本机开发配置构造 URL，不打印密码或完整 URL，不在仓库保存临时执行脚本。执行失败保留实际错误与状态，不 force 或删除订单；成功后通过 CLI version 和数据库新查询核对 version=2、dirty=0、uq_orders_request_id 的列与唯一性，并确认订单数量未改变。此轮不回退版本 1，也不自动进入 B2；回滚事务中的重复插入实验仍按教学节奏先预测再执行，留待迁移后继续。
+
 ## 8. 开发步骤与学习节奏
 
 整个阶段分多次完成，**不是一次 60–90 分钟内写完**。每次只选下面一个目标，完成并记录后再继续。
@@ -241,12 +253,57 @@ HAVING COUNT(*) > 1;
 3. 实现 InsertOrder 时，将确认属于 request_id 唯一键的 1062 转为内部 `ErrRequestIDTaken`；它不同于对客户端的 `ErrRequestConflict`。
 4. 参数校验是应用检查；数据库唯一性是并发保障，不能只做前者或只做预查询。
 
+本轮 B2 review 验证约定（2026-10-12）：学习者已修改查询、校验和重放，要求再次 review。先读取实际差异，不代改其 Go 文件。为验证纯函数业务结果，在 /private/tmp 建立临时目录，原样复制实际 service.go/store.go/model.go，用临时 Go 测试覆盖请求键长度/字符边界、商品 ID/数量正值、同参数重放及不同数量冲突；不访问数据库、不写订单、不用 mock 证明并发正确性。测试预期依据第 3/4 节业务约定，测试失败保留为实际结果并指导学习者修改，结束清理临时目录；仓库不新增测试文件或依赖。Create 未找到订单后的占位控制流按实际代码审查，事务和 POST 仍不在本轮实现范围。
+
 ### 小步 C：事务内 SQL 与下单编排
 
 1. 手写 BeginTx、InsertOrder、ReadProduct、LockInventory、DeductInventory；确认 SQL 都用 tx。
 2. 手写 Service.Create，严格按第 5 节顺序；先实现成功与回滚，再实现重复键后的回滚和重查。
 3. `created_at` 在应用生成；取得 LastInsertId，错误要处理。所有 SQL 都用占位符，不能拼接客户端内容。
 4. 区分查不到商品、没有库存行、库存不足、SQL 故障与提交结果不确定。影响行数不是 1 时回滚。
+
+InsertOrder 的教学拆分（2026-10-12）：学习者完成 BeginTx 后进入插入方法，当前轮只认识 INSERT INTO orders (request_id, product_id, quantity, created_at) VALUES (?, ?, ?, ?) 及 tx.ExecContext 的调用/返回值；id 由自增生成，四个参数按列顺序来自 input 与传入的 createdAt。先由学习者在聊天中尝试调用，避免把未使用 result 或未实现返回结构的半成品记录为已完成。后续再讲 sql.Result.LastInsertId 与 Order 构建，然后用 errors.As 精确识别 request_id 唯一键的 MySQL 1062；当前插入步骤不提交事务或扩大到后续商品/库存操作。
+
+正常路径补齐子步（2026-10-12）：学习者已把 SQL/调用写入实际方法，错误分类暂为注释。当前先让 Exec 错误分支明确返回 Order{} 和包装的 ErrStorageUnavailable，防止失败后使用可能不存在的 result；再调用 result.LastInsertId()，处理其 error，成功用生成的 ID、input 的三个字段和传入 createdAt 构造 Order 并返回 nil error。这个子步仅完成普通错误与成功路径，重复键此时仍暂按存储错误处理，须在下一轮替换为精确的 ErrRequestIDTaken 分支，不能提前做幂等验收或称 InsertOrder 全部完成。方法不 Commit/Rollback、不重新生成创建时间。
+
+返回结构说明（2026-10-12）：InsertOrder 取得自增 ID 后，当前表的其他返回字段均已来自 input/createdAt，直接构造 Go 的 Order 值即可，不通过 FindByID 或连接池查回未提交行。构造返回结构不新增 SQL 写入，也不代表事务提交；调用者仍需按第 5 节继续检查商品/库存并决定 Commit/Rollback。
+
+### DeductInventory 本轮实施约定（2026-10-13）
+
+学习者明确授权导师完成 store.go 中的 DeductInventory，再详细讲解 SET 与更新执行 API。范围仅此方法及本文，不代改相邻 ReadProduct/LockInventory、Service 或迁移，不新增依赖。
+
+- 前提：Service 已校验正数量，并在同一 tx 内按主键锁住库存行、判断 available >= quantity；本方法只执行扣减，不另加条件更新方案。
+- SQL：UPDATE inventory SET available = available - ? WHERE product_id = ?，参数顺序为 quantity、productID，使用 tx.ExecContext 和调用方 context。
+- 失败行为：SQL 执行失败或 RowsAffected 读取失败，返回包装的 ErrStorageUnavailable 并保留 cause；影响行数不是 1，返回 ErrInvariantViolation。UPDATE 未匹配行可能没有 SQL 错误，因此不能只检查 Exec 的 error。
+- 成功行为：恰好修改一行返回 nil；不 Commit/Rollback，生命周期仍由 Service 管理。该方法单独不能保证库存非负，仍依赖上述锁定与检查前提。
+- 实施顺序：先记录约定 → 只补方法 → gofmt/build/vet/差异检查 → 实际环境核验后运行局部事务实验 → 记录实现、证据与遗留。
+- 临时验证设计：在 /private/tmp 建临时模块，复制实际 order 三文件、database/mysql.go 及现有 go.mod/go.sum；使用真实 MySQL 普通应用用户，仅在显式事务中插入唯一测试库存行 available=5，同一事务锁读、扣 2、读取 3，再 Rollback，用新查询确认测试行不存在。接着对已确认缺失的同一 ID 验证影响行数为 0 对应 ErrInvariantViolation，并验证已取消的执行 context 返回 ErrStorageUnavailable 且保留 context.Canceled。测试不提交、不写订单、不清理真实业务数据，结束移除临时文件；不是完整下单或并发验收。
+- 学习预测：学习者预测事务内库存为 5、回滚后行不存在。导师已补充事务能看到自己的修改，扣后应为 3；回滚后不存在的预测正确。得到预测后才执行数据库实验。
+
+### Create 事务边界教学拆分（2026-10-13）
+
+学习者已手写新建分支，明确要求 review 并讲解何时提交/回滚；本轮导师只审查、给局部 API 提示及记录，不代改 service.go 或其他业务方法。当前一个小目标是 C2 的普通成功与回滚路径，不一次补齐 C3 并发重复分支或 POST。
+
+- BeginTx 成功后立即 defer tx.Rollback()；defer 属于整个 Create 函数，嵌套 if 中的提前 return 也会触发。Go 函数 return 本身不结束数据库事务，context 取消后的自动回滚不能代替正常路径主动清理。
+- 订单插入、商品检查、锁库存和扣减都使用同一个 tx，顺序沿用第 5 节。InsertOrder 返回未提交的新 Order，不复用预查询无记录时的零值。
+- Commit 只放在订单插入及所有检查、扣减成功之后；Commit 返回 nil 才返回新建成功。Commit 错误包装 ErrCommitUnknown 与原始 cause，不用后续 Rollback 宣称提交未发生。
+- 中途业务或 SQL 失败时返回原错误，由 deferred Rollback 兜底；成功提交后的 deferred Rollback 返回 sql.ErrTxDone，不撤销提交。不用 defer Commit，避免提前错误返回时仍提交。
+- 需继续处理请求的重复键分支不只依赖 defer：必须先显式 Rollback，检查回滚错误，再从连接池重查；本轮记录但留待 C3 实施。
+- 当前 ReadProduct 查询三列但 Scan 两列会阻断正常路径，需由学习者先修正；LockInventory 缺行分类和 InsertOrder 重复键识别继续保留为未完成。
+- 验证安排：本轮先 build/vet/差异检查及静态控制流审查。学习者修改后再逐条检查提前返回与提交位置；具备完整路径后，按第 9 节逐项先预测再执行正常下单与失败回滚实验。当前不运行尚不完整的 Create，也不把已通过的局部库存测试当成 Create 验收。
+
+### Create/Store 本轮授权修正约定（2026-10-13）
+
+学习者在第三次 review 中明确授权导师直接修正剩余问题，并修改 if 嵌套；此次授权覆盖当前 Service.Create 及其依赖的 Store 错误分类，可完成此前留待 C3 的分支。本轮先补充本约定，再修改实现；不自动完成 POST、迁移、Redis/gRPC 或暂缓 GET 项，不提交/暂存，不改变学习者已有 Git index。
+
+- 核对当前事实：ReadProduct 已由学习者修正为 SELECT id/is_active，不再代改；LockInventory 当前把所有 Scan 错误归为 ErrInventoryMissing，需要恢复无行/依赖故障的区分。
+- Create 通过提前返回展开主流程：校验失败返回；预查询找到即 replay；非 ErrOrderNotFound 的查询错误直接返回；未找到才 BeginTx。成功开启后 defer Rollback，并在商品/库存检查之前 InsertOrder。createdAt 取一次 UTC 时间并截断至微秒；Commit 确认后才返回新 Order，提交错误保留 ErrCommitUnknown/cause。
+- InsertOrder 用 errors.As 提取已有 mysql 驱动的 *mysql.MySQLError，同时检查 Number=1062 和错误消息末尾的完整唯一键名称。只接受当前 MySQL 格式的 for key 'orders.uq_orders_request_id' 或 for key 'uq_orders_request_id'，不因重复值中出现索引名而误判其他约束；其他错误归为 ErrStorageUnavailable，均保留 cause。驱动没有独立索引名称字段，此处限定当前已核对的 MySQL 8.4 格式，未知格式保守按依赖错误处理，不新增依赖。
+- Service 遇 ErrRequestIDTaken 先显式 Rollback；回滚错误用标准库 slog.ErrorContext 仅记录 request_id、阶段与安全错误类别，再包装 ErrStorageUnavailable 并立即返回，不打印原始 cause/SQL/连接配置、不通过连接池重查。回滚成功后 FindByRequestID，再 replay；若意外查无记录，本项目无删单业务，按 ErrInvariantViolation 保留查无记录 cause，避免伪装成正常订单不存在；其他查询错误原样向上传递。
+- LockInventory 仅 sql.ErrNoRows 归为 ErrInventoryMissing；其他 Scan/连接/context 错误包装 ErrStorageUnavailable/cause。其他 SQL 方法保留现有职责。
+- 先执行 gofmt、build、vet 和 git diff --check。为覆盖难以真实注入的提交/回滚及查询错误，可在 /private/tmp 复制实际 order 源码和已有模块文件，使用临时 database/sql driver 测试重复键精确分类、Store 缺行与 context 错误分类、Service 提交失败/重复分支回滚失败及清理顺序；不新增仓库依赖、接口或测试文件，不用这些模拟结果证明数据库并发正确性。
+- 真实库实验原计划使用独立测试商品/request_id，并限定清理本轮记录；学习者随后明确表示本轮无需使用真实开发库验证，因此取消本轮真实库实验，不查询业务库、不写入测试数据。后续实际 MySQL 创建/回滚/并发验收继续留待独立实验轮次，本轮只使用上述临时 driver 的无数据库测试。
+- 学习者预测两种重复请求路径：首笔已完成时由预查询找到；请求重叠时后者插入触发唯一键错误。导师补充后者不是最终业务失败，Service 需先回滚再查原订单并返回 Replayed=true，最终一笔订单/库存 0；尚不宣称学习者已反馈掌握该补充。未执行/未通过的验证如实记录，不把模拟结果等同于真实 MySQL、POST HTTP、1000 请求并发或真实 Commit 确认丢失验收。
 
 ### 小步 D：POST HTTP 与失败实验
 
@@ -265,7 +322,7 @@ HAVING COUNT(*) > 1;
 
 | 验收项 | 操作 | 合格标准 | 实际结果 |
 | --- | --- | --- | --- |
-| 迁移 | 检查版本与唯一索引 | 版本 2 非 dirty；唯一键存在 | 未执行 |
+| 迁移 | 检查版本与唯一索引 | 版本 2 非 dirty；唯一键存在 | 2026-10-12 通过：预检查 orders=0、无重复，迁移前 version=1/dirty=0；migrate up 1 输出 2/u add_request_id_unique（8.5255ms），退出码 0；CLI version=2，数据库新查询 version=2/dirty=0，SHOW INDEX 确认 uq_orders_request_id(request_id)、Non_unique=0；orders 仍为 0。重复插入回滚实验尚未执行 |
 | 普通下单与查单 | 库存 3，购买 2；GET 订单 | POST 201、GET 200；订单数量 2，库存 1 | 未执行 |
 | 重启持久化 | 重启服务后 GET 原订单 | 同一个订单、相同参数与创建时间 | 未执行 |
 | 重复成功 | 同键同参数再次 POST | 200、replayed=true、相同订单 ID；库存不再减少 | 未执行 |
@@ -298,9 +355,19 @@ HAVING COUNT(*) > 1;
 - [x] 小步 A 子步骤：`OrderHandler.Get` 已实现路径 ID 解析、5 秒请求超时、成功 JSON 和安全错误映射。
 - [x] 小步 A 子步骤：`runHTTP` 已组装并由 `main.go` 接入；`runHTTPServer` 实现监听结果传递、退出通知、优雅关闭和超时强制关闭，并通过本地 HTTP 生命周期测试。
 - [x] `HTTP_ADDR` 环境变量、Server 的读写和空闲超时配置；学习者反馈显式配置地址的启动及 400 响应符合预期，其他地址与慢连接超时尚未运行验证。
-- [ ] 版本 2 SQL 编写与迁移。
+- [x] 版本 2 up/down SQL 编写与静态审查；按学习者明确授权由导师完成。
+- [x] 版本 2 重复数据预检查、实际迁移及版本/唯一索引核验。
+- [ ] 唯一键重复插入与回滚清理实验；B1 尚余此项。
+- [x] B2：FindByRequestID 已由学习者实现并修正列名，参数化查询/Scan/错误分类静态审查及编译通过；真实查询仍待验证。
+- [x] B2：validateInput 和 validRequestID 已由学习者实现，12 个临时纯函数测试用例通过。
+- [x] B2：replay 数量比较已修正，3 个临时纯函数重放用例全部通过。
+- [x] C1：Store.BeginTx 已由学习者实现，静态审查与编译通过；2026-10-13 局部库存测试已执行真实库开事务及显式回滚，尚无提交故障/完整下单验收。
+- [x] C1：DeductInventory 按学习者明确授权由导师完成，真实 MySQL 扣减/回滚、缺失行和取消原因的三个局部测试通过，race 无报告；不代表完整业务并发验收。
+- [x] C1：ReadProduct 两列映射已由学习者修正；LockInventory 无行/其他错误分类按授权修正，4 个临时 driver 分类用例通过；真实查询验收仍待完成。
+- [x] B3：InsertOrder request_id 唯一键分类按授权实现，9 个临时 driver 错误分类用例通过；实际 MySQL 消息格式和重复插入回滚实验仍待验证。
+- [x] C2/C3：Create 按授权修正主流程顺序、UTC/微秒时间、重复键回滚后重查/replay 和 if 嵌套；22 个临时 driver 流程用例通过，完整真实库/HTTP/并发验收仍待完成。
 - [ ] GET 真实 MySQL 完整运行验收；应用连接启动和非法 ID 的 400 已由学习者反馈通过，404/200、重启持久化和真实 SIGTERM 暂缓。
-- [ ] POST、事务、行锁、唯一键和重复语义实现。
+- [ ] POST HTTP handler 实现；已实现的 Service/Store 事务、行锁与重复语义仍需真实库及 HTTP 验收。
 - [ ] 数据库与 HTTP 实验执行，填写第 9 节实际结果。
 
 目前查单代码已实现，但真实 MySQL 运行验收尚未完成；成功下单、幂等和并发正确性仍为设计约定，不是已实现事实。最终完成时逐项更新，保留尚未通过的实验和原因。
@@ -334,6 +401,144 @@ HAVING COUNT(*) > 1;
 2026-10-12 学习节奏调整：学习者反馈应用启动日志及 GET /orders/abc 的响应全部符合预期，并明确选择本轮先测试到这里，继续实现下单接口。按学习者最新要求，剩余查单验收暂缓，不能记录为通过；应用连接检查和 400 路径也不能证明 orders 查询、持久化或真实进程退出已经验收。本轮没有插入查单测试订单。后续按既定小步 B 开始：先检查目标库现有 request_id 重复数据，再由学习者手写版本 2 up/down 唯一索引 SQL，导师审查后执行迁移，用回滚测试事务观察重复键。该学习节奏调整不取消最终验收项目，也未授权导师代写后续业务 TODO；下一轮先讨论唯一约束的作用边界，指导重复数据预检查。
 
 2026-10-12 会话职责调整：学习者明确要求本会话只串联管理主线和做代码 review，具体开发及教学转移到另开的专项会话。为支持直接用本文交接，新增第 1 节会话分工和当前接手摘要，保留第 12 节教学指引；新专项会话从 B1 开始，并在结束时更新本文，供主线 review 核对。本轮仅整理交接文档，没有继续实现业务或执行迁移。
+
+2026-10-12 B1 专项教学接手（迁移尚未实施）：已阅读根目录 AGENTS.md、本文及 001 完成记录，用 git status、git diff 和实际 Go/SQL 文件核对。接手时已有未提交修改为本文、cmd/order/http.go 和 cmd/order/main.go，内容对应此前 HTTP 配置及交接记录；无暂存改动。GET 链路、HTTPConfig 和配置传递已存在，POST、Service.Create、FindByRequestID、校验/重放和事务 SQL 仍为占位，两个版本 2 SQL 文件尚不存在。导师本次只更新本文接手摘要与完成记录，未修改 Go 或版本 1 SQL，未代写版本 2。
+
+- 环境核验：go version 为 go1.27.1 darwin/arm64；Docker Compose ps 确认 flash-order-dev-mysql-1 healthy，映射 127.0.0.1:3306。默认沙箱访问 Docker socket 被拒绝后，经执行授权完成只读核验。宿主机没有可用的 mysql 命令，容器内客户端可用。/Users/royce/go/bin/migrate 的 -version 输出 dev；go version -m 确认其模块版本为 v4.20.1、构建带 mysql 标签，未安装或升级依赖。
+- 数据库核验：用容器内普通应用用户执行 SELECT VERSION()/DATABASE()、查询 schema_migrations 和 SHOW INDEX FROM orders。实际为 MySQL 8.4.11、目标库 flash_order、version=1、dirty=0，orders 只有 PRIMARY(id)。本次均为只读操作，未输出密码或连接 URL，未执行重复数据查询、迁移或写入测试订单。
+- 验证范围：以上环境与数据库结果由导师实际核验；git diff --check 通过。未重新运行 Go build/vet/race，已有通过记录仍归属于此前 HTTP 配置轮次。B1 唯一索引存在性、重复键失败和测试数据回滚清理均未验收，第 9 节迁移项仍为未执行。收尾再次核对时 HEAD 为 cf678ef（feat: add http config load），两个 HTTP 文件的实现仍存在且已无工作区差异，仅本文保留本轮未提交修改；导师本轮未执行 Git 提交。
+- 学习停点（接手时）：本轮目标只到 B1。先让学习者预测“已有两行相同 request_id 时添加唯一索引”的结果，再亲手执行第 7 节重复数据预检查；接手时尚无学习者回答或执行结果。后续回答与语法辅导见下方补充记录。若预检查发现重复，停止迁移并由学习者决定处理方式，不删单、不 force。
+- 下一停点：完成预检查后，由学习者手写 000002_add_request_id_unique.up.sql/down.sql，导师审查再迁移，确认 version=2、非 dirty 和唯一索引，并在显式回滚的测试事务中观察重复插入错误与清理结果。B1 完成后记录并停下，B2 校验/重放/按请求 ID 查询留待后续；GET 404/200、重启查单与真实 SIGTERM 验收继续按学习者要求暂缓。
+
+2026-10-12 B1 索引语法辅导：学习者预测已有重复 request_id 时添加唯一索引会报错，判断正确；同时询问版本 1 是否完全没有索引及如何添加索引。导师澄清 PRIMARY KEY(id) 已建立主键索引，CHECK(quantity > 0) 不建立索引，并给普通索引与唯一索引的通用语法模板；由学习者在聊天中先尝试写出针对 orders/request_id 的添加语句，再审查。尚未收到学习者的 SQL 尝试，未创建迁移文件、执行预检查或修改数据库，不能记录 B1 通过或已掌握索引语法。本轮仅更新本文，git diff --check 通过；下一步仍须在执行版本 2 前完成第 7 节重复数据预检查。
+
+2026-10-12 B1 up 语句审查：学习者在聊天中提交 ALTER TABLE orders ADD UNIQUE INDEX uq_orders_request_id (request_id)，表名、索引类型、索引名和列均符合设计；导师提示补终止分号并保存至 migrations/000002_add_request_id_unique.up.sql。实际核对迁移目录仍只有版本 1 两个文件，尚未保存版本 2，未执行 SQL；下一停点是学习者亲手创建 up 文件后审查，再指导 down。第 7 节重复数据预检查、迁移版本/索引验证和回滚实验均继续待完成。导师本次仅更新本文，git diff --check 通过。
+
+2026-10-12 B1 两个 SQL 文件完成：学习者明确要求导师代写两个文件供其阅读学习。先在第 7 节记录本轮授权与范围，再创建 migrations/000002_add_request_id_unique.up.sql 和对应 down.sql。up 只对 orders 添加 uq_orders_request_id(request_id) 唯一索引；down 只删除该索引，两者均包含完整 ALTER TABLE 语句和终止分号，不改表数据或版本 1。已读取实际文件静态核对表名、索引名、列及作用范围，git diff --check 通过；对两个未跟踪 SQL 文件另运行 git diff --no-index --check /dev/null <文件>，均无空白错误诊断（退出码 1 表示新文件与 /dev/null 有差异）。Git 状态为本文修改及两个新增 SQL 文件，尚未暂存/提交。
+
+验证与停点：本轮没有执行 SQL、预检查或迁移，没有写入测试订单，未运行 Go build/vet/race；静态审查不等于 MySQL 实际执行成功。两个文件已完成，数据库唯一约束仍未应用，B1 运行验收尚未通过。学习者已经能预测已有重复数据时会报错，并写出添加语句；DROP INDEX 和实际迁移流程仍待其阅读与实验。下一步由学习者熟悉两条 SQL，再在目标开发库执行第 7 节重复数据预检查；无重复后运行版本 2，确认 version=2、dirty=0 和 SHOW INDEX 的唯一性，并用回滚事务观察重复键且验证测试订单无遗留。B2 和暂缓的查单验收不在本轮范围。
+
+2026-10-12 B1 版本 2 实际迁移：学习者询问是否在每次启动时执行全部 up，并反馈数据库为空、明确表示可以直接迁移。导师先核对 cmd/order 与 internal/database，确认应用没有调用迁移；结合既有 migrate CLI 的 -help 和 v4.20.1 实现说明：CLI 读取 schema_migrations 的当前版本和 dirty 状态，从该版本的后续脚本继续；up 1 表示执行后续一个版本。第 7 节先记录本轮执行授权与失败边界，再运行。
+
+- 预检查实际结果：使用容器内普通应用用户只读查询，目标库 flash_order，version=1、dirty=0，orders 数量为 0；第 7 节重复 request_id 查询无结果，SHOW INDEX 只有 PRIMARY(id)。检查通过，没有删除数据或 force。
+- 执行实际结果：从本机开发配置构造脱敏处理的迁移 URL（连接预算 3 秒），调用既有 /Users/royce/go/bin/migrate -path ./migrations -database <开发 URL> up 1，输出 2/u add_request_id_unique（8.5255ms），退出码 0；紧接 CLI version 输出 2，退出码 0。没有输出密码/完整 URL，没有保存临时脚本、修改 Go 或回退迁移。
+- 验收实际结果：用数据库新查询确认目标库仍为 flash_order，version=2、dirty=0；SHOW INDEX 存在 uq_orders_request_id，列 request_id、Non_unique=0，原 PRIMARY(id) 也存在；订单数量仍为 0。第 9 节迁移项已更新为通过，唯一索引已生效。git diff --check 通过；未重跑 Go build/vet/race，也未运行重复插入事务实验或并发下单。
+- 接手停点：学习者尚未反馈对迁移版本机制的理解；下一轮先预测同一测试事务中两次相同 request_id 插入的结果，再观察重复键错误，显式回滚并用新查询确认测试订单无遗留。B1 尚余该实验，不能以迁移通过代替幂等或并发验收。B2 和已暂缓的查单项目继续留待后续。
+
+2026-10-12 下单流程讨论停点：学习者最新要求关注 POST，下单草案为预查 request_id → 开事务锁库存/扣减 → 插订单 → 结束事务。导师读取第 3/5 节与实际 Service.Create、Store 方法核对；业务方法仍是占位，本轮没有修改 Go 或执行数据库操作。审查重点是：已有订单先比较 product_id/quantity；当前方案应先在事务内插订单占唯一键，再检查商品可售、锁库存和扣减；成功以 Commit 为界，失败需回滚。先用库存 1、相同 request_id 的两次并发请求都预查未找到的时序，让学习者预测原草案第二个请求的响应，再解释顺序的理由；尚未收到预测，不能记录为理解已确认。B1 回滚实验保留为未执行，按学习者最新关注先讨论流程，不扩展到整条 POST 实现或代写 TODO。下一停点是完成该时序推演，再按 B2 一次选一个函数亲手实现。接手摘要和第 10 节已同步，git diff --check 通过。
+
+2026-10-12 事务概念停点：学习者确认 B 应返回 A 的订单，并主动发现“提交”和“结束事务”的概念盲点。导师补充原草案的实际路径会返回库存不足，随后只讲一个概念：提交是结束事务的一种方式，回滚也是；事务内 SQL 执行成功仍属于未提交修改，Commit 成功才确认生效，Rollback 撤销该事务中的修改，两者完成后释放事务持有的锁。结合本项目说明提前插入订单后库存不足可以回滚，Go 函数 return 本身不是数据库提交/回滚指令；Commit 错误仍沿用结果未确认约定，不推断为已回滚。本轮只更新本文，未改业务代码或执行数据库实验，git diff --check 通过。学习者尚未反馈对该概念的理解；下一停点先确认这一点，再回到唯一键占用与同键并发顺序，之后按 B2 单函数实施。B1 重复插入回滚实验与暂缓的查单验收仍未执行。
+
+2026-10-12 唯一键与幂等推理进度：学习者自行说明 request_id 的并发保障来自数据库唯一索引而非应用预查询，并提出事务内先插订单、库存不足回滚，表明已能应用回滚与占键顺序。导师确认该核心推理，补充唯一约束只保证同键最多一个已提交订单，完整业务幂等还需重复键后显式回滚、通过连接池重查、同参数返回原单/不同参数冲突；只有确认来自 request_id 唯一键的重复错误才进入重放分支。同时说明在本轮两个同键请求时序中，A 尚未结束事务时 B 插入可能等待，A 提交后得到重复键，A 回滚后 B 可继续插入。允许讨论省略预查询的可行性，但第 5 节当前设计仍保留预查询作为避免重复写入尝试的优化，未改实现方案。本轮只更新本文，git diff --check 通过，业务代码和数据库数据未修改。上述补充仍待学习者反馈；随后从 B2 一次一个函数落实，B1 回滚实验和查单遗留继续保留为未执行。
+
+2026-10-12 预查询选择与 B2 入口：学习者用 A/B 交错时序指出两次预查询都可能为空，导师确认该场景不会省掉后续操作，但重复键后回滚/重查仍能返回赢家订单；随后学习者明确选择保留预查询。该选择沿用当前设计，没有更改代码流程；“大部分情况下节省性能”是学习者判断，尚无重复率或性能测量支持，记录为取舍而非实测结论。下一轮只指导 Store.FindByRequestID：读取并沿用已实现 FindByID 的显式字段、Scan 顺序与错误规则，WHERE 改为 request_id = ?，通过连接池传同一 context 和 requestID 参数；找到返回 Order，sql.ErrNoRows 转 ErrOrderNotFound，其他错误归为 ErrStorageUnavailable 并保留 cause。导师已核对实际函数仍为占位，学习者尚未提交实现；本轮仅更新本文，git diff --check 通过，没有执行数据库或 Go 测试。保存后先审查并编译，编译通过不等于真实数据库/幂等验收。B1 回滚实验与暂缓的 GET 验收继续保留为未执行，未扩展到 Service.Create 或 POST 全链路。
+
+2026-10-12 B2 查询与 Create 片段审查：学习者亲手修改 internal/order/store.go 的 FindByRequestID，并在 internal/order/service.go 的 Create 中调用预查询，要求导师审查及说明 Store/事务的职责。实际代码与 Git diff 已核对，导师未代改 Go。正确部分为参数化 request_id 查询、同一 context、显式字段/Scan 结构及 Store 的无记录/存储错误分类；尚有以下正确性问题，未将函数记录为完成：
+
+- store.go 第 56 行使用 create_at，实际表列为 created_at；执行任意预查询都会报未知列并归为 ErrStorageUnavailable。编译检查无法发现 SQL 字符串中的列名错误，先由学习者修正。
+- service.go 第 39–40 行把所有错误直接返回，包含代表“可以进入创建路径”的 ErrOrderNotFound；应区分找到、未找到和其他存储错误。第 43 行比较 Order 零值不能作为记录存在性判断，正常找到的订单反而落入 ErrNotImplemented，未找到路径则已提前返回。找到分支还需按约定比较 product_id/quantity，不能直接将不同参数的请求返回成功。
+- 学习者提出查重后再校验 request_id；第 4/5 节约定要求先 validateInput（含请求键、商品 ID 与数量）再预查询。validateInput 和 replay 仍是占位，实现与接入继续按单函数节奏完成，不推进完整事务或 POST。
+
+设计解释：Store 不必按表一一拆分；BeginTx 当前只是从连接池开启一个事务的薄入口，Service 管理事务范围，跨多个本服务 Store 的组合只需同一个事务入口和同一 tx。InsertOrder 接收 tx 是为了保证它与扣库存共同回滚，不是 SQL 写操作一律必须手动开启事务；若订单通过连接池自动提交，之后库存检查失败时回滚下单事务，订单仍会留下。第 6 节补充该职责说明，未重构接口或新增组件。
+
+实际验证：GOCACHE=/private/tmp/flash-order-review-go-cache GOFLAGS=-buildvcs=false go build ./... 退出码 0；git diff --check 通过。未运行真实 SQL、测试订单或 Go 测试，不把编译通过记为查询/重放验收通过。学习者对新增架构解释仍待反馈；下一停点先亲手修正查询列名和 Create 预查询三类结果，再逐个完成 validateInput/replay。BeginTx、InsertOrder、事务编排与 POST 仍为占位，B1 回滚实验和暂缓 GET 验收仍未执行。
+
+2026-10-12 B2 再次 review：学习者反馈已理解 Store/事务设计，并亲手修改查询列名、Create 校验/查重分支，新增 validRequestID 辅助函数，实现 validateInput 与 replay。导师读取实际代码和差异，未代改 Go。已修复事实：FindByRequestID 使用 created_at；校验位于预查询之前；请求键按 1–64 字节 ASCII 白名单检查，商品 ID 和数量要求正值，符合当前输入类型边界。
+
+仍待修复的正确性问题：service.go 第 90 行将订单数量与 int32(input.ProductID) 比较，应比较 input.Quantity（双方已是 int32）。实际旧单商品 1/数量 2、同参数重试会误报 ErrRequestConflict；旧单商品 1/数量 1、请求数量改为 2 反而得到 Replayed=true。第 49–56 行的 ErrOrderNotFound 分支只有 TODO 注释，仍会继续执行 replay(Order{}, input)，对合法新请求返回 ErrRequestConflict；本小步创建路径未实现时，应明确返回 ErrNotImplemented，找到订单才进入 replay，其他存储错误继续透传。
+
+实际验证：先在第 8 节补充临时验证约定，再把三个实际 Go 文件原样复制到 /private/tmp 临时目录，以 go test -count=1 -v service.go store.go model.go b2_review_test.go 验证纯函数，不访问数据库。12 个输入校验用例全部通过，覆盖合法字符、64/65 字节、空键、非 ASCII、空格/标点、商品 ID/数量的零值负值及最大正值。3 个重放用例中 changed_product 通过，same_parameters 与 changed_quantity 失败，测试退出码 1，未忽略或记为通过；临时目录及测试文件已清理。go build ./... 退出码 0，gofmt -l 两个变更 Go 文件无输出，git diff --check 通过。检查使用已有临时 GOCACHE 和 GOFLAGS=-buildvcs=false，未新增仓库测试文件或依赖。
+
+当前完成边界：Store 查询代码静态审查和输入校验通过；replay、Create 未找到分支尚未通过。下一停点只修正上述两处，再复查相关纯函数结果，不推进事务或完整 POST。真实 SQL、B1 重复插入回滚实验、GET 遗留及数据库幂等/并发验收均未执行；代码与文档待学习者纳入 Git 提交。
+
+2026-10-12 重放修复与 Store 创建路线：学习者修复 replay，并说明 Create 新建分支尚留 TODO 是因为不会实现 Store 的事务/插入等方法，要求列出完成创建流程所需能力。导师核对实际代码：replay 已比较 existing.Quantity/input.Quantity 与 ProductID；其余五个 Store 方法均为 ErrNotImplemented 占位。按第 5/6 节说明 BeginTx → InsertOrder → ReadProduct → LockInventory → DeductInventory 的职责，商品可售/库存足够等业务判断及统一 Commit/Rollback 由 Service 负责。request_id 重复键仍需先回滚，再通过连接池重新查询并重放；不让各 Store 方法自行提交。
+
+复验实际结果：沿用第 8 节临时验证方式，原样复制当前三个 Go 文件到 /private/tmp，以 go test -count=1 -v service.go store.go model.go b2_review_test.go 重跑 same_parameters、changed_quantity、changed_product，3 项全部通过，退出码 0，临时目录已清理。仅复验受本次修复影响的重放逻辑，未重跑输入校验/全项目测试或执行数据库操作；此前失败记录保留为历史，最新重放状态改为通过。导师本轮只更新本文，没有修改 Go 或补齐完整流程，git diff --check 通过。
+
+下一停点：先由学习者只实现 Store.BeginTx(ctx)，调用连接池的 BeginTx(ctx, nil)，本轮不定制事务选项；成功返回 tx，失败归为 ErrStorageUnavailable 并保留 cause。保存后审查与编译，再进入 InsertOrder 的 SQL/返回 ID/重复键识别，逐轮推进。Create 未找到分支目前仍穿过 TODO 调用 replay，未实现事实不变；本轮路线说明不代表该路径已可用。B1 回滚实验、真实查询、查单遗留和最终事务/幂等/并发验收继续待执行。
+
+2026-10-12 BeginTx review 与 InsertOrder 入口：学习者亲手完成 Store.BeginTx，导师核对实际 store.go 第 83–91 行及 Git diff。实现透传 ctx，以 nil 选项调用连接池 BeginTx，错误返回 nil 事务并包装 ErrStorageUnavailable/cause，成功返回 tx/nil；未在方法内提交或回滚，符合 Service 拥有事务生命周期的约定。未发现该实现的正确性问题，导师未代改 Go。
+
+验证实际结果：GOCACHE=/private/tmp/flash-order-review-go-cache GOFLAGS=-buildvcs=false go build ./... 退出码 0；gofmt -l internal/order/store.go 无输出，git diff --check 通过。没有给薄包装方法编写镜像测试，也未访问 MySQL 或验证开启/取消/回滚的实际生命周期；不把编译通过记为数据库业务验收。其余 Store 事务方法仍为 ErrNotImplemented，InsertOrder 仅删除了 TODO 标记，业务实现尚未增加；Create 未找到分支遗留不变。
+
+下一停点：进入 InsertOrder，但一轮只讲紧密相关的 INSERT/ExecContext。给出四列参数化 SQL，说明自增 id 不需由调用方提供、字段与参数按位置对应、使用传入 tx 执行而非连接池；ExecContext 返回执行结果与 error，成功仍是未提交插入。等待学习者在聊天中尝试调用后，再推进 LastInsertId/返回 Order 和重复键分类，暂不生成完整函数或文件。接手摘要与教学拆分已更新；B1 回滚实验、真实查询和暂缓 GET 验收继续待执行。
+
+2026-10-12 InsertOrder 部分实现 review：学习者写入 INSERT SQL、传入 tx 执行及四个参数，并用注释表示重复请求键分类/其他错误返回的思路。导师读取实际 store.go 第 93–115 行及差异，确认字段、占位符、参数顺序和 tx 使用均符合设计。注释表示方向正确，但其他 SQL 错误仍应包装 ErrStorageUnavailable 并保留 cause，而非仅返回无法分类的原始错误；错误分支需要 return，不能落入正常路径读取 result。当前尚无成功返回及重复键分类，导师没有代改 Go。
+
+实际验证：GOCACHE=/private/tmp/flash-order-review-go-cache GOFLAGS=-buildvcs=false go build ./... 退出码 1，明确报告 store.go:102 result 未使用、store.go:115 missing return，属于方法尚未完成，未忽略或记录为通过。git diff --check 通过；没有执行真实 INSERT、写测试订单或运行 Go 测试。
+
+下一停点：先只补 Exec 的普通失败返回及 LastInsertId/返回 Order，通过编译后再学习 errors.As 和 request_id 唯一键的精确分类。返回订单仍表示未提交数据，Service 管理最终提交/回滚。正常路径通过不等于重复键或真实数据库验收通过。B1 回滚实验、Create 新建分支、后续 Store 商品/库存方法与 POST、暂缓查单验收继续留待后续。
+
+2026-10-12 InsertOrder 正常路径复查：学习者已实现 Exec 错误返回、LastInsertId 与其错误返回，随后通过 s.FindByID(ctx, id) 获取完整订单。导师读取实际 store.go 第 93–125 行及差异，确认 SQL/参数/tx、普通错误包装和取 ID 部分正确；第 119 行查回是正确性问题。FindByID 实际调用 s.db.QueryRowContext，另取池连接、在原事务外读取，而订单仍未提交；正常隔离下会查不到，若连接池全部被在途事务占用还可能等待池连接超时。这是依据代码与事务约定的时序分析，本轮没有访问 MySQL 复现。
+
+修改方向与停点：只替换事务外查回和其返回段，用已知 id、input.RequestID/ProductID/Quantity 与 createdAt 构造 Order 并返回 nil。这是整理 Go 返回值，不是再创建数据库订单或提前提交；此处没有需要数据库生成并查回的额外字段。学习者已尝试后，导师给局部返回结构示例供亲手修改，不提供完整方法或代改源码。修正后再复查正常路径，随后学习 request_id 唯一键的 MySQL 1062 分类；普通错误统一包装仍是阶段性实现，不能称幂等完成。
+
+实际验证：GOCACHE=/private/tmp/flash-order-review-go-cache GOFLAGS=-buildvcs=false go build ./... 退出码 0，gofmt -l internal/order/store.go 无输出，git diff --check 通过。没有运行数据库或新增测试，编译通过不证明未提交订单的可见性、事务原子性或重复键行为通过。导师仅更新本文，B1 回滚实验、Create 新建分支、其余 Store/POST 和暂缓 GET 验收保留为遗留。
+
+2026-10-13 DeductInventory 实现与教学：学习者明确授权导师完成该方法，并要求详细讲解 SET 与 MySQL 更新调用。导师先阅读根目录 AGENTS.md、本文以及最新 Git/源码，在第 8 节记录实施与临时实验约定，然后只实现 internal/order/store.go 的 DeductInventory：同一 tx.ExecContext 执行 UPDATE inventory SET available = available - ? WHERE product_id = ?，参数 quantity/productID；执行或 RowsAffected 读取失败时包装 ErrStorageUnavailable/cause，影响行数不是 1 时返回带行数的 ErrInvariantViolation，成功返回 nil，不提交/回滚。不修改 Service、相邻方法或迁移，不新增依赖。
+
+学习预测与实验：导师通过异步问题先说明仅在显式回滚事务中插入唯一测试库存行，available=5，再扣 2。学习者预测事务内为 5、回滚后行不存在；导师先解释事务可见自己的修改，扣后为 3，回滚后不存在判断正确，然后才执行实验。临时行只用于库存数据层，不创建商品或成功订单；没有提交。
+
+环境实测：Compose mysql healthy，映射 127.0.0.1:3306；MySQL 8.4.11，目标库 flash_order，迁移 version=2/dirty=0；SHOW CREATE TABLE inventory 确认 InnoDB、product_id 主键及 available INT，无外键或非负 CHECK。普通应用用户配置通过本机文件传入进程，没有输出密码或完整连接 URL。
+
+验证实测：gofmt、go build ./...、go vet ./... 和 git diff --check 通过，使用已有临时 GOCACHE/GOFLAGS。按第 8 节设计在 /private/tmp 建临时模块，复制当前实际 order/database 源码与现有模块文件，以 go test -race -count=1 -v ./internal/order -run '^TestDeductInventoryReview$' 执行真实库测试，三个子用例全部通过，退出码 0、race 无报告：
+
+- deduct_then_rollback：同一事务锁读 5，调用本方法扣 2 后读 3，显式回滚后新查询得到 sql.ErrNoRows。
+- missing_row_is_invariant_error：对上述已确认不存在的测试 ID 扣减，实际 RowsAffected=0，返回 ErrInvariantViolation，事务回滚。
+- canceled_context_preserves_cause：已取消的执行 context 返回 ErrStorageUnavailable，errors.Is 同时确认 context.Canceled，事务回滚。
+
+最终新查询确认测试 ID 的库存行数为 0；临时模块/测试文件已清理，仓库未新增测试或依赖。测试只覆盖实际执行过的库存局部路径，未验证完整下单、订单/库存共同提交、重复键或高并发；当前 MySQL 驱动 RowsAffected 的读取错误分支没有人工注入测试。
+
+新增用户代码核对与遗留：InsertOrder 已移除事务外查回、正常返回结构正确，重复键分类仍待完成。ReadProduct 选择 id/name/is_active 三列但 Scan 仅接收 ID/IsActive，存在商品时会触发列数不匹配；LockInventory 未将 sql.ErrNoRows 转为 ErrInventoryMissing。导师仅指出并记录这两处，未超出授权修正。Create 新建 TODO、POST 和 B1 重复插入回滚实验、暂缓 GET 验收仍待完成。
+
+下一停点：学习者先对照实现理解 UPDATE 中 SET 的列赋值、WHERE 的筛选、参数位置以及 ExecContext 返回执行结果；确认为什么执行成功但影响 0 行仍应拒绝成功，并区分事务内可见自己的修改与提交。随后专项 review ReadProduct/LockInventory 遗留，再按原阶段完善重复键分类和 Service 编排；本轮不自动推进下一方法。本文接手摘要和第 10 节已同步，代码和文档尚未提交。
+
+2026-10-13 Create 事务边界 review（接续扣库存教学）：读取根目录 AGENTS.md、本文和 001 完成记录，核对 git status/git diff 与实际 service.go/store.go/model.go。学习者在 Create 中新增 BeginTx、ReadProduct、可售判断、LockInventory、库存数量判断和 DeductInventory；参数校验/已有订单重放及同 tx 传递正确。正确性缺口为：BeginTx 后所有提前返回都缺少事务清理；没有调用 InsertOrder；没有 Commit 就可能返回 nil error；返回的 order 来自未找到记录的预查询，仍为零值。ReadProduct 的列数不匹配目前使已有商品的新建请求先返回 ErrStorageUnavailable，故后面的所谓成功路径只是静态可达意图，不是实测成功。导师未修改任何 Go 代码。
+
+本轮讲解范围按第 8 节 C2 拆分：事务由 Service 统一管理，BeginTx 成功后 defer Rollback 兜底，订单与库存操作均通过后才 Commit，成功提交后再返回新订单；提交失败保留结果不确定语义，重复键显式回滚后重查的 C3 留待下一轮。已通过异步问题请求学习者预测“未 Commit/Rollback 且 context 未取消时，直接 return 错误是否结束事务、连接和锁如何变化”，记录时尚未收到回答，不宣称已掌握。
+
+验证：使用 GOCACHE=/private/tmp/flash-order-review-go-cache GOFLAGS=-buildvcs=false，go build ./... 和 go vet ./... 均退出 0；git diff --check 通过。仅说明编译/静态检查通过，未执行新的数据库、完整 Create、提交故障或并发实验，也未复跑与本次审查无关的 HTTP 测试。实际变更仅更新本文第 1 节接手摘要、第 8 节教学拆分与第 10 节记录；未提交或暂存。
+
+遗留与下一停点：学习者先理解 defer Rollback/显式 Commit 的执行时机，再亲手修改普通新建路径，插入顺序遵循第 5 节并使用 InsertOrder 返回的新 Order；先修正阻断路径的 ReadProduct 列数映射。下一次 review 核对每条事务内提前返回、先占键顺序及 Commit 成功后的返回，之后另轮完善 LockInventory 缺行分类、InsertOrder 重复键识别与 C3。POST、B1 重复插入回滚实验和已暂缓 GET 项继续待执行，本轮不能标记 C2 完成。
+
+2026-10-13 Create 第二次 review 与 Go 错误检查说明：学习者明确要求先审查逻辑，再解释多处 if err != nil 是否正常。重新核对根目录 AGENTS.md、本文、git status/git diff 和实际 Go 源码；本轮 Go 改动均由学习者完成，导师仅更新本文。
+
+已修正事实：Create 在 BeginTx 成功后立即 defer tx.Rollback()；商品/库存/订单 SQL 均传同一 tx；InsertOrder 返回的新 Order 用于成功结果；Commit 只在插入及扣库存都成功后执行，其错误包装 ErrCommitUnknown 与 cause，返回新建成功位于 Commit 确认之后。相比上次的事务未清理、未插入/提交和零值成功结果，这些缺口已修正。参数校验、预查询已有结果重放、库存数量判断也经静态控制流核对正确；不能据此称完整幂等性或 C2 已通过。
+
+剩余逻辑问题按实际路径记录：
+
+- ReadProduct 仍查询 id/name/is_active 三列却 Scan 两个目标，商品存在的新建请求将因列数不匹配返回 ErrStorageUnavailable，随后 deferred Rollback；目前不能真实走到扣库存/提交成功路径。
+- InsertOrder 当前位于 DeductInventory 之后。修正商品查询后，若同键同参数 A/B 都预查询未找到且库存为 1，A 先锁库存、扣减、插入并提交，B 随后锁读 0，在尝试占唯一键前报 ErrInsufficientStock，违背返回 A 原订单的语义。需移到 BeginTx/defer 后、商品与库存检查前，沿用第 5 节；顺序问题不表示同一事务内插入失败会留下已提交的库存扣减。
+- InsertOrder 仍把全部插入错误归类 ErrStorageUnavailable，Service 也只直接返回。库存充足时，同键并发失败方会遇到 request_id 唯一键冲突，返回依赖错误，未执行“精确识别 ErrRequestIDTaken → 显式回滚 → 连接池重查 → replay”。先移动插入位置仍不能单独完成此 C3 遗留。
+- LockInventory 未将 sql.ErrNoRows 转为 ErrInventoryMissing，将缺库存行错归为数据库不可用，违反第 4 节数据不完整与依赖故障的区分。
+- Create 调用 InsertOrder 时传 time.Now()；首次返回直接保留本地时区/纳秒精度，重放则读数据库 DATETIME(6) 与 UTC 配置，响应时间表示/精度可能不同。按既有约定应在应用取一次 time.Now().UTC().Truncate(time.Microsecond)。已核对实际驱动写入时按配置 Loc 转换，因此不把此问题描述为数据库必然写错时区。
+
+风格与教学说明：Go 用返回的 error 显式表达可恢复失败，多处 if err != nil 属于常见写法；各阶段可有不同失败语义，尤其重复键需继续重查、Commit 错误需结果不确定分类。优先用提前返回减少外层“查不到订单”分支嵌套，局部提示为“查询成功先 replay；其他错误先 return；只让 ErrOrderNotFound 往下进入事务”。这是可读性建议，不是当前正确性故障，不代改或引入 WithTx/链式执行/panic 抽象。只有重复的完整职责值得抽取，不因检查语句相似就隐藏错误路径。
+
+验证：GOCACHE=/private/tmp/flash-order-review-go-cache GOFLAGS=-buildvcs=false 下 go build ./...、go vet ./... 均退出 0，git diff --check 通过。未运行数据库、新业务测试、提交故障或并发实验；之前库存局部 race 证据保留，未当成本次 Create 验证。本轮实际改动仅本文接手摘要和第 10 节进度/记录，未暂存或提交。
+
+下一停点：保持一个小目标 C2，学习者先亲手修正插入顺序、ReadProduct 列映射和 createdAt；复查普通成功/回滚路径后再进入 C3 精确重复键处理。外层流程扁平化属于可选风格改善，不设为通过条件。LockInventory 缺行分类、POST、B1 重复插入回滚实验以及暂缓 GET 项继续记录为遗留。
+
+2026-10-13 Create 第三次 review 后授权修正：学习者明确要求剩余问题直接修改，并同时改善 if 嵌套。核对实际代码及 git status/git diff --cached 后发现 ReadProduct 已由学习者修正，LockInventory 被改为将所有错误归为 ErrInventoryMissing。进入本轮时五项改动已被学习者暂存；导师未修改 index、未提交，仅在该基础上修改工作树中的 service.go/store.go 与本文。
+
+先按第 8 节补实施约定，再实际修改：
+
+- Service.Create 用校验/预查询的提前返回展开普通新建路径；同一事务先 InsertOrder 占键，再读商品、锁库存、检查和扣减；取一次 UTC/微秒时间，成功提交后返回新 Order。
+- 唯一键碰撞时显式回滚后从连接池查原订单，并用既有 replay 比较；回滚失败仅记录安全 request_id/阶段/类别，返回 ErrStorageUnavailable/cause 且不重查；意外查无订单归为 ErrInvariantViolation/cause。Commit 错误仍为 ErrCommitUnknown，不宣称已回滚。
+- Store.InsertOrder 使用 errors.As 提取 *mysql.MySQLError，检查 1062 与完整 request_id 索引名后缀，分类为 ErrRequestIDTaken，保留驱动 cause；其他索引/错误仍为依赖错误。未新增外部依赖。该分类依赖当前 MySQL 英文消息格式，未知格式保守报依赖错误，实际消息验证本轮未执行。
+- LockInventory 仅 sql.ErrNoRows 映射 ErrInventoryMissing，其他 Scan/连接/context 错误包装 ErrStorageUnavailable/cause。ReadProduct 的学习者修正保留；模型、迁移和 POST 未修改。
+
+学习互动与范围调整：导师说明计划使用测试专用商品和请求键执行真实库验证并只清理本轮记录；学习者明确表示本轮无需真实开发库验证，因此未建立业务库连接或写入测试数据。之前仅只读执行 Compose ps，确认 mysql 容器 healthy/127.0.0.1:3306，不算本轮数据库验收。学习者预测已提交请求被预查询找到，重叠请求在插入处收到唯一键错误；导师补充后者回滚后仍返回原订单，最终应只有一笔订单/库存 0。尚未收到对该补充的理解反馈。
+
+实际验证：gofmt、GOCACHE=/private/tmp/flash-order-review-go-cache GOFLAGS=-buildvcs=false 下 go build ./...、go vet ./... 和 git diff --check 全部退出 0。在 /private/tmp 临时模块中原样复制实际 order 三个 Go 文件与原 go.mod/go.sum，使用自定义 database/sql driver、单连接池（检验重复路径是否先释放事务再借池连接），运行 go test -race -count=1 -json ./internal/order，35 个子用例通过、退出 0、race 无报告：
+
+- InsertOrder 分类 9 项：带 orders 前缀/无前缀/已包装的 request_id 唯一键，PRIMARY、其他唯一键、重复值中含索引名/伪造 key 子句、非 1062、模拟 context 错误；检查分类与 cause。
+- LockInventory 分类 4 项：缺行、数据库故障、模拟 context 错误、无法转换的库存字段；依赖错误不能冒充缺数据。
+- Create 流程 22 项：非法输入，预查询重放/参数冲突/故障，开启失败，普通插入/LastInsertId 失败，商品不存在/不可售，库存缺行/故障/不足，扣减/影响行数错误，提交成功/提交未知，重复键回滚后重放/参数冲突/回滚失败/重查缺行/重查故障。核对提前失败不 Commit、不返回成功，重复路径先 Rollback 再池查询，成功返回插入得到的 ID 和同一 UTC/微秒时间，重放保留原创建时间。
+
+临时模块/driver/测试文件已清理，仓库未新增测试文件、公共接口或依赖。模拟结果只覆盖被执行的 Go 分支；未验证真实 SQL 错误格式、数据库持久化/行锁、同键与不同键并发、真实提交确认丢失，不把 -race 或模拟提交成功当作 MySQL 并发验收。
+
+遗留与下一停点：学习者先查看本轮未暂存的 Service/Store 差异，理解提前返回、先占唯一键、errors.As 与 errors.Is 的层次，以及重复键后显式回滚的作用；本轮不自动开始 POST。POST handler 仍待实现；B1 重复插入回滚实验、真实 Service/HTTP/并发与第 9 节其他实验、暂缓 GET 项继续保留未执行。接手摘要和本节已同步；本轮只完成当前 Create/Store 修正，不宣称 002 阶段全部完成。
 
 ## 11. 参考
 
