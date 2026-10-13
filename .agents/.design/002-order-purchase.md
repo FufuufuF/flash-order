@@ -2,7 +2,7 @@
 
 ## 1. 文档状态与学习约定
 
-- 状态：设计已确定；框架、查单代码、HTTP 配置和启停已实现，HTTP 生命周期本地测试通过；版本 2 唯一索引迁移已应用并验收，回滚事务中的重复插入实验待执行；学习者反馈真实 MySQL 连接启动及 GET 非法 ID 的 400 响应符合预期，其余查单验收暂缓；下单业务待完成。
+- 状态：设计已确定；框架、查单代码、HTTP 配置和启停已实现，HTTP 生命周期本地测试通过；版本 2 唯一索引迁移已应用并验收，回滚事务中的重复插入实验待执行；POST HTTP handler 已实现，但真实 HTTP/数据库下单验收仍待执行；学习者反馈真实 MySQL 连接启动及 GET 非法 ID 的 400 响应符合预期，其余查单验收暂缓。
 - 前置阶段：`001-database-bootstrap.md`。已有数据库连接、退出清理和版本 1 三张表。
 - 本文承接最近讨论：本阶段直接实现事务、`SELECT ... FOR UPDATE` 和 request_id 唯一约束，不再从无并发保护的版本开始。
 - 学习者亲手实现 TODO。辅助 agent 每次只指导一个小步骤：解释问题和取舍，给函数签名、伪代码或关键 SQL，等待学习者尝试，再审查。未经明确授权，不补齐整条链路或生成完整文件。
@@ -17,6 +17,7 @@
 - 暂缓验收：GET 404/200、重启后的查单和真实 SIGTERM 下的关闭顺序。学习者已明确选择先进入下单实现，不重复把这些项目设为本轮前置任务，也不记录为通过。
 - B1 实际进度：按学习者明确授权完成两个版本 2 SQL 文件及迁移，版本 1 未修改。预检查确认目标开发库 flash_order、版本 1 非 dirty、orders=0 且无重复；migrate up 1 成功应用版本 2，CLI 与数据库新查询确认 version=2、dirty=0、uq_orders_request_id(request_id) 存在且 Non_unique=0，订单数仍为 0。重复插入与回滚清理实验继续待执行，未把 B1 全部记录为通过。
 - 当前教学停点：2026-10-13 学习者明确授权导师第三次 review 后直接修正 Create/Store 与 if 嵌套。学习者已先修正 ReadProduct 两列映射；导师现已将 Create 主流程展开、InsertOrder 前移至商品/库存检查前、时间统一 UTC/微秒，补齐重复键显式回滚后重查/replay、回滚失败的安全日志与依赖错误、重查意外无单的 ErrInvariantViolation；保留正确的 Commit/ErrCommitUnknown 边界。Store.InsertOrder 用 MySQL 1062+完整索引名后缀分类 request_id 冲突并保留 cause；LockInventory 只将无行归为 ErrInventoryMissing，其他错误归为 ErrStorageUnavailable。build/vet/差异检查及临时 driver 的 35 个模拟子用例（-race）通过，临时文件已清理；这些只验证 Go 逻辑，不证明真实 SQL/行锁/并发正确性。按学习者最新指示，本轮未使用真实开发库验证、未写测试业务数据。当前 C1/B3/C2/C3 的对应代码已补齐，运行验收仍待完成；下一停点为学习者对照未暂存差异理解分支与 errors.As/Is。POST、B1 重复插入回滚实验、真实下单/并发验收和暂缓 GET 项继续待执行。历史 DeductInventory 三个真实 MySQL 局部测试证据保留，见第 10 节。
+- 2026-10-13 POST handler 已按用户明确授权实现：请求 Content-Type 使用 `mime.ParseMediaType`，接受带参数的 `application/json`；请求体用 `http.MaxBytesReader` 限制为 4 KiB；使用 `DisallowUnknownFields` 并二次 Decode 拒绝多个 JSON 值；调用 service 时派生 5 秒 context；新建返回 201、重放返回 200；成功与错误均通过统一 JSON 编码辅助函数输出。错误映射补齐商品不存在、商品不可售、库存不足、请求冲突、库存数据异常、提交结果未知和存储不可用等约定。未改变 Service/Store、路由或依赖。
 - 新专项会话先读根目录 AGENTS.md、本文第 10 节最新记录和第 12 节教学约定，再用 git status/git diff 核对实际进度。旧记录中的“下一步”代表当时停点；当前入口以本摘要和最新记录为准。每次只推进一个 60–90 分钟内可完成的小目标，结束时回填实现、验证和遗留项。
 
 ## 2. 要解决的问题、目标与范围
@@ -367,7 +368,7 @@ InsertOrder 的教学拆分（2026-10-12）：学习者完成 BeginTx 后进入�
 - [x] B3：InsertOrder request_id 唯一键分类按授权实现，9 个临时 driver 错误分类用例通过；实际 MySQL 消息格式和重复插入回滚实验仍待验证。
 - [x] C2/C3：Create 按授权修正主流程顺序、UTC/微秒时间、重复键回滚后重查/replay 和 if 嵌套；22 个临时 driver 流程用例通过，完整真实库/HTTP/并发验收仍待完成。
 - [ ] GET 真实 MySQL 完整运行验收；应用连接启动和非法 ID 的 400 已由学习者反馈通过，404/200、重启持久化和真实 SIGTERM 暂缓。
-- [ ] POST HTTP handler 实现；已实现的 Service/Store 事务、行锁与重复语义仍需真实库及 HTTP 验收。
+- [x] POST HTTP handler 实现；请求解析、JSON 响应和 service 错误映射已按设计完成；已实现的 Service/Store 事务、行锁与重复语义仍需真实库及 HTTP 验收。
 - [ ] 数据库与 HTTP 实验执行，填写第 9 节实际结果。
 
 目前查单代码已实现，但真实 MySQL 运行验收尚未完成；成功下单、幂等和并发正确性仍为设计约定，不是已实现事实。最终完成时逐项更新，保留尚未通过的实验和原因。
@@ -539,6 +540,10 @@ InsertOrder 的教学拆分（2026-10-12）：学习者完成 BeginTx 后进入�
 临时模块/driver/测试文件已清理，仓库未新增测试文件、公共接口或依赖。模拟结果只覆盖被执行的 Go 分支；未验证真实 SQL 错误格式、数据库持久化/行锁、同键与不同键并发、真实提交确认丢失，不把 -race 或模拟提交成功当作 MySQL 并发验收。
 
 遗留与下一停点：学习者先查看本轮未暂存的 Service/Store 差异，理解提前返回、先占唯一键、errors.As 与 errors.Is 的层次，以及重复键后显式回滚的作用；本轮不自动开始 POST。POST handler 仍待实现；B1 重复插入回滚实验、真实 Service/HTTP/并发与第 9 节其他实验、暂缓 GET 项继续保留未执行。接手摘要和本节已同步；本轮只完成当前 Create/Store 修正，不宣称 002 阶段全部完成。
+
+2026-10-13 POST HTTP handler 实现与轻量验证：学习者明确授权直接完成 `internal/httpapi/order.go`，本轮范围限于 HTTP 边界，不修改事务和数据库代码。实际实现了 `Content-Type` 解析、4 KiB 请求体限制、严格 JSON 解码、单值检查、5 秒 service context、201/200 成功状态和文档约定的错误 JSON；复用统一 JSON writer，并将 GET 成功响应也改为复用该 writer。通过 `errors.Is` 补齐业务错误到 HTTP 状态码和安全错误码的映射，不向客户端输出 SQL、DSN 或驱动原文。
+
+实际验证：`gofmt` 与 `git diff --check` 通过。第一次在默认沙箱执行 `go test ./...` 时，既有 HTTP 生命周期测试因禁止绑定 `127.0.0.1` 回环端口失败；在一次受控授权下使用临时 `GOCACHE` 重跑，`cmd/order` 测试及其余包全部通过。未新增测试文件，未连接 MySQL，未执行真实下单、重放或并发验收；因此只记录 HTTP handler 的编译和现有测试兼容性通过，真实接口行为仍待第 9 节实验。
 
 ## 11. 参考
 
